@@ -4,6 +4,7 @@ import aiohttp
 import sqlite3
 import logging
 import os
+import re
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
@@ -36,7 +37,8 @@ def init_db():
             link TEXT,
             tech_park TEXT,
             description TEXT,
-            company_profile TEXT
+            company_profile TEXT,
+            email TEXT
         )
     """)
     conn.commit()
@@ -199,14 +201,23 @@ async def scrape_technopark_jobs():
             page += 1
         return all_jobs
 
+# Function to extract email addresses from text
+def extract_emails(text):
+    email_pattern = r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+'
+    return re.findall(email_pattern, text)
+
 def save_jobs_to_db(jobs):
     conn = sqlite3.connect("jobs.db")
     cursor = conn.cursor()
-    cursor.executemany("""
-        INSERT INTO jobs
-        (company, role, deadline, link, tech_park, description, company_profile)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, jobs)
+    for job in jobs:
+        company, role, deadline, link, tech_park, description, company_profile = job
+        emails = extract_emails(description)
+        email = emails[0] if emails else ""
+        cursor.execute("""
+            INSERT INTO jobs
+            (company, role, deadline, link, tech_park, description, company_profile, email)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (company, role, deadline, link, tech_park, description, company_profile, email))
     conn.commit()
     conn.close()
     logging.info(f"Saved {len(jobs)} jobs to SQLite database.")
@@ -221,7 +232,8 @@ def save_jobs_to_supabase(jobs):
             "link": job[3],
             "tech_park": job[4],
             "description": job[5],
-            "company_profile": job[6]
+            "company_profile": job[6],
+            "email": extract_emails(job[5])[0] if extract_emails(job[5]) else ""
         }
         for job in jobs
     ]
