@@ -10,8 +10,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 import json
 from supabase import create_client, Client
-from aiohttp import ClientSession
-from concurrent.futures import ThreadPoolExecutor
+from aiohttp import ClientSession, ClientTimeout
 
 # Load environment variables
 load_dotenv()
@@ -46,17 +45,19 @@ def init_db():
     conn.commit()
     conn.close()
 
-async def fetch(session, url):
+async def fetch(session, url, timeout=30):
     try:
         ssl_context = ssl.create_default_context()
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
-        async with session.get(url, ssl=ssl_context) as response:
+        async with session.get(url, ssl=ssl_context, timeout=timeout) as response:
             response.raise_for_status()
             return await response.text()
+    except asyncio.TimeoutError:
+        logging.error(f"Timeout error fetching {url}")
     except Exception as e:
         logging.error(f"Error fetching {url}: {e}")
-        return None
+    return None
 
 def extract_emails(text):
     email_pattern = r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+'
@@ -141,10 +142,11 @@ async def get_technopark_job_details(session, job_link):
 
     return description, company_profile
 
-async def scrape_jobs(base_url, get_job_details, tech_park):
-    async with aiohttp.ClientSession() as session:
+async def scrape_jobs(base_url, get_job_details, tech_park, max_concurrent_requests=10):
+    async with aiohttp.ClientSession(timeout=ClientTimeout(total=30)) as session:
         page = 1
         all_jobs = []
+        semaphore = asyncio.Semaphore(max_concurrent_requests)
         while True:
             url = f"{base_url}?page={page}"
             html_or_json = await fetch(session, url)
@@ -175,7 +177,12 @@ async def scrape_jobs(base_url, get_job_details, tech_park):
             if not jobs_in_page:
                 break
 
-            details = await asyncio.gather(*[get_job_details(session, link) for (_, _, _, link, _) in jobs_in_page])
+            tasks = []
+            for company, role, deadline, link, tech_park in jobs_in_page:
+                task = asyncio.create_task(get_job_details(session, link))
+                tasks.append(task)
+
+            details = await asyncio.gather(*tasks)
             for i, (company, role, deadline, link, tech_park) in enumerate(jobs_in_page):
                 desc, comp_profile = details[i]
                 all_jobs.append((company, role, deadline, link, tech_park, desc, comp_profile))
@@ -184,7 +191,8 @@ async def scrape_jobs(base_url, get_job_details, tech_park):
                 break
         return all_jobs
 
-async def fetch_missing_emails(jobs, session):
+async def fetch_missing_emails(jobs, session, max_concurrent_requests=10):
+    semaphore = asyncio.Semaphore(max_concurrent_requests)
     tasks = []
     for job in jobs:
         if len(job) < 8:
@@ -192,22 +200,23 @@ async def fetch_missing_emails(jobs, session):
 
         if not job[7]:  # Check if email is missing
             job_link = job[3]
-            task = asyncio.create_task(fetch_email(session, job_link, job))
+            task = asyncio.create_task(fetch_email(session, job_link, job, semaphore))
             tasks.append(task)
     results = await asyncio.gather(*tasks)
     for job in results:
         if job:
             update_job_email_in_db(job)
 
-async def fetch_email(session, job_link, job):
-    html = await fetch(session, job_link)
-    if html:
-        soup = BeautifulSoup(html, "html.parser")
-        email_section = soup.find("div", class_="email-section")  # Adjust the class name as needed
-        if email_section:
-            email = email_section.get_text(strip=True)
-            if email:
-                return job[:7] + (email,)
+async def fetch_email(session, job_link, job, semaphore):
+    async with semaphore:
+        html = await fetch(session, job_link)
+        if html:
+            soup = BeautifulSoup(html, "html.parser")
+            email_section = soup.find("div", class_="email-section")  # Adjust the class name as needed
+            if email_section:
+                email = email_section.get_text(strip=True)
+                if email:
+                    return job[:7] + (email,)
     return None
 
 def update_job_email_in_db(job):
@@ -265,7 +274,7 @@ async def main():
     if all_jobs:
         save_jobs_to_db(all_jobs)
         save_jobs_to_supabase(all_jobs)
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=ClientTimeout(total=30)) as session:
             await fetch_missing_emails(all_jobs, session)
     else:
         logging.info("No jobs found.")
