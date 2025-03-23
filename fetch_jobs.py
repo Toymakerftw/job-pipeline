@@ -5,12 +5,12 @@ import sqlite3
 import logging
 import os
 import re
+import json
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
-import json
 from supabase import create_client, Client
 from aiohttp import ClientSession, ClientTimeout
+from typing import Tuple, List, Dict, Optional, Any, Union
 
 # Load environment variables
 load_dotenv()
@@ -18,6 +18,7 @@ INFOPARK_URL = os.getenv("INFOPARK_URL", "https://infopark.in/companies/job-sear
 TECHNOPARK_URL = os.getenv("TECHNOPARK_URL", "https://technopark.org/api/paginated-jobs")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+DB_FILE = "jobs.db"
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -25,9 +26,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Database setup remains the same
-def init_db():
-    conn = sqlite3.connect("jobs.db")
+# Database setup
+def init_db() -> None:
+    """Initialize SQLite database with jobs table if it doesn't exist."""
+    conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS jobs (
@@ -45,7 +47,8 @@ def init_db():
     conn.commit()
     conn.close()
 
-async def fetch(session, url, timeout=30):
+async def fetch(session: ClientSession, url: str, timeout: int = 30) -> Optional[str]:
+    """Fetch URL content with SSL context and timeout handling."""
     try:
         ssl_context = ssl.create_default_context()
         ssl_context.check_hostname = False
@@ -59,16 +62,18 @@ async def fetch(session, url, timeout=30):
         logging.error(f"Error fetching {url}: {e}")
     return None
 
-def extract_emails(text):
+def extract_emails(text: str) -> List[str]:
+    """Extract email addresses from text using regex pattern."""
     email_pattern = r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+'
     return re.findall(email_pattern, text)
 
-async def get_infopark_job_details(session, job_link):
+async def get_infopark_job_details(session: ClientSession, job_link: str) -> Tuple[str, str]:
+    """Scrape job details and company profile from Infopark job page."""
     html = await fetch(session, job_link)
     if not html:
         return "", ""
+    
     soup = BeautifulSoup(html, "html.parser")
-
     description_div = soup.find("div", class_="deatil-box")
     description = description_div.get_text(strip=True) if description_div else ""
 
@@ -108,12 +113,13 @@ async def get_infopark_job_details(session, job_link):
 
     return description, company_profile
 
-async def get_technopark_job_details(session, job_link):
+async def get_technopark_job_details(session: ClientSession, job_link: str) -> Tuple[str, str, str]:
+    """Scrape job details, company profile, and email from Technopark job page."""
     html = await fetch(session, job_link)
     if not html:
-        return "", ""
+        return "", "", ""
+    
     soup = BeautifulSoup(html, "html.parser")
-
     description_div = soup.find("div", class_="mb-4 flex w-full flex-col gap-8 pb-12 pt-10 lg:w-2/3")
     description = ""
 
@@ -140,110 +146,99 @@ async def get_technopark_job_details(session, job_link):
             f"Website: {website}"
         )
 
-    return description, company_profile
+    # Extract email directly
+    email = ""
+    a_tag = soup.find("a", href=lambda href: href and href.startswith("mailto:"))
+    if a_tag:
+        email = a_tag.get_text(strip=True)
+        if not email:
+            email = a_tag["href"].replace("mailto:", "").strip()
 
-async def scrape_jobs(base_url, get_job_details, tech_park, max_concurrent_requests=10):
+    return description, company_profile, email
+
+async def scrape_jobs(base_url: str, tech_park: str, max_concurrent_requests: int = 10) -> List[Tuple]:
+    """Scrape jobs from the specified tech park."""
     async with aiohttp.ClientSession(timeout=ClientTimeout(total=30)) as session:
         page = 1
         all_jobs = []
         semaphore = asyncio.Semaphore(max_concurrent_requests)
+        
         while True:
             url = f"{base_url}?page={page}"
             html_or_json = await fetch(session, url)
             if not html_or_json:
                 break
 
+            jobs_in_page = []
+            
             if tech_park == "Infopark":
                 soup = BeautifulSoup(html_or_json, "html.parser")
-                jobs_in_page = []
                 for row in soup.select("#job-list tbody tr"):
                     job_role = row.select_one("td.head").get_text(strip=True)
                     company = row.select_one("td.date").get_text(strip=True)
                     deadline = row.select_one("td:nth-child(3)").get_text(strip=True)
                     job_link = row.select_one("td.btn-sec a")["href"] if row.select_one("td.btn-sec a") else ""
-                    jobs_in_page.append((company, job_role, deadline, job_link, tech_park))
+                    jobs_in_page.append((company, job_role, deadline, job_link))
+                
+                # Check if there's a next page
+                has_next_page = bool(soup.select_one("li.page-item a[rel='next']"))
+                
             elif tech_park == "Technopark":
                 data = json.loads(html_or_json)
                 if not data.get("data"):
                     break
-                jobs_in_page = []
+                
                 for job in data["data"]:
                     company = job["company"]["company"]
                     job_role = job["job_title"]
                     deadline = job["closing_date"]
                     job_link = f"https://technopark.org/job-details/{job['id']}"
-                    jobs_in_page.append((company, job_role, deadline, job_link, tech_park))
-
+                    jobs_in_page.append((company, job_role, deadline, job_link))
+                
+                # Check if there's a next page based on pagination data
+                has_next_page = data.get("current_page", 0) < data.get("last_page", 0)
+            
             if not jobs_in_page:
                 break
 
             tasks = []
-            for company, role, deadline, link, tech_park in jobs_in_page:
-                task = asyncio.create_task(get_job_details(session, link))
-                tasks.append(task)
+            for company, role, deadline, link in jobs_in_page:
+                if tech_park == "Infopark":
+                    task = asyncio.create_task(get_infopark_job_details(session, link))
+                else:  # Technopark
+                    task = asyncio.create_task(get_technopark_job_details(session, link))
+                tasks.append((company, role, deadline, link, task))
 
-            details = await asyncio.gather(*tasks)
-            for i, (company, role, deadline, link, tech_park) in enumerate(jobs_in_page):
-                desc, comp_profile = details[i]
-                all_jobs.append((company, role, deadline, link, tech_park, desc, comp_profile))
+            for company, role, deadline, link, task in tasks:
+                if tech_park == "Infopark":
+                    desc, comp_profile = await task
+                    email = extract_emails(desc)[0] if extract_emails(desc) else ""
+                else:  # Technopark
+                    desc, comp_profile, email = await task
+                
+                all_jobs.append((company, role, deadline, link, tech_park, desc, comp_profile, email))
+            
             page += 1
-            if tech_park == "Infopark" and not soup.select_one("li.page-item a[rel='next']"):
+            if not has_next_page:
                 break
+                
         return all_jobs
 
-async def fetch_missing_emails(jobs, session, max_concurrent_requests=10):
-    semaphore = asyncio.Semaphore(max_concurrent_requests)
-    tasks = []
-    for job in jobs:
-        if len(job) < 8:
-            job = job + ("",)
-
-        if not job[7]:  # Check if email is missing
-            job_link = job[3]
-            task = asyncio.create_task(fetch_email(session, job_link, job, semaphore))
-            tasks.append(task)
-    results = await asyncio.gather(*tasks)
-    for job in results:
-        if job:
-            update_job_email_in_db(job)
-
-async def fetch_email(session, job_link, job, semaphore):
-    async with semaphore:
-        html = await fetch(session, job_link)
-        if html:
-            soup = BeautifulSoup(html, "html.parser")
-            email_section = soup.find("div", class_="email-section")  # Adjust the class name as needed
-            if email_section:
-                email = email_section.get_text(strip=True)
-                if email:
-                    return job[:7] + (email,)
-    return None
-
-def update_job_email_in_db(job):
-    conn = sqlite3.connect("jobs.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE jobs
-        SET email = ?
-        WHERE link = ?
-    """, (job[7], job[3]))
-    conn.commit()
-    conn.close()
-    logging.info(f"Updated email for job: {job[3]}")
-
-def save_jobs_to_db(jobs):
-    conn = sqlite3.connect("jobs.db")
+def save_jobs_to_db(jobs: List[Tuple]) -> None:
+    """Save jobs to SQLite database."""
+    conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.executemany("""
         INSERT INTO jobs
         (company, role, deadline, link, tech_park, description, company_profile, email)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, [(job[0], job[1], job[2], job[3], job[4], job[5], job[6], extract_emails(job[5])[0] if extract_emails(job[5]) else "") for job in jobs])
+    """, jobs)
     conn.commit()
     conn.close()
     logging.info(f"Saved {len(jobs)} jobs to SQLite database.")
 
-def save_jobs_to_supabase(jobs):
+def save_jobs_to_supabase(jobs: List[Tuple]) -> None:
+    """Save jobs to Supabase database."""
     jobs_dict_list = [
         {
             "company": job[0],
@@ -253,31 +248,90 @@ def save_jobs_to_supabase(jobs):
             "tech_park": job[4],
             "description": job[5],
             "company_profile": job[6],
-            "email": extract_emails(job[5])[0] if extract_emails(job[5]) else ""
+            "email": job[7]
         }
         for job in jobs
     ]
 
     response = supabase.table('jobs').insert(jobs_dict_list).execute()
 
-    if hasattr(response, 'error'):
+    if hasattr(response, 'error') and response.error:
         logging.error(f"Failed to insert jobs into Supabase: {response.error}")
     else:
         logging.info(f"Saved {len(jobs)} jobs to Supabase.")
 
-async def main():
+def get_jobs_missing_email() -> List[Tuple]:
+    """Retrieve all jobs where email is missing or empty."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT company, role, deadline, link, tech_park, description, company_profile, email
+        FROM jobs
+        WHERE (email IS NULL OR TRIM(email) = '')
+    """)
+    jobs = cursor.fetchall()
+    conn.close()
+    return jobs
+
+async def update_missing_emails() -> None:
+    """Update jobs with missing emails."""
+    jobs_missing_email = get_jobs_missing_email()
+    if not jobs_missing_email:
+        logging.info("No jobs with missing emails found.")
+        return
+
+    async with aiohttp.ClientSession(timeout=ClientTimeout(total=30)) as session:
+        semaphore = asyncio.Semaphore(10)
+        tasks = []
+        
+        for job in jobs_missing_email:
+            job_link = job[3]
+            tech_park = job[4]
+            
+            async def process_job(job_link, tech_park):
+                async with semaphore:
+                    if tech_park == "Infopark":
+                        html = await fetch(session, job_link)
+                        if html:
+                            desc, _ = await get_infopark_job_details(session, job_link)
+                            email = extract_emails(desc)[0] if extract_emails(desc) else ""
+                    else:  # Technopark
+                        _, _, email = await get_technopark_job_details(session, job_link)
+                    
+                    if email:
+                        # Update in SQLite
+                        conn = sqlite3.connect(DB_FILE)
+                        cursor = conn.cursor()
+                        cursor.execute("UPDATE jobs SET email = ? WHERE link = ?", (email, job_link))
+                        conn.commit()
+                        conn.close()
+                        
+                        # Update in Supabase
+                        supabase.table('jobs').update({"email": email}).match({"link": job_link}).execute()
+                        logging.info(f"Updated job: {job_link} with email: {email}")
+            
+            tasks.append(asyncio.create_task(process_job(job_link, tech_park)))
+        
+        await asyncio.gather(*tasks)
+
+async def main() -> None:
+    """Main function to scrape and update jobs."""
     init_db()
-    infopark_jobs = await scrape_jobs(INFOPARK_URL, get_infopark_job_details, "Infopark")
-    technopark_jobs = await scrape_jobs(TECHNOPARK_URL, get_technopark_job_details, "Technopark")
+    
+    # Scrape new jobs
+    infopark_jobs = await scrape_jobs(INFOPARK_URL, "Infopark")
+    technopark_jobs = await scrape_jobs(TECHNOPARK_URL, "Technopark")
     all_jobs = infopark_jobs + technopark_jobs
 
     if all_jobs:
         save_jobs_to_db(all_jobs)
         save_jobs_to_supabase(all_jobs)
-        async with aiohttp.ClientSession(timeout=ClientTimeout(total=30)) as session:
-            await fetch_missing_emails(all_jobs, session)
+        logging.info(f"Scraped and saved {len(all_jobs)} jobs in total.")
     else:
-        logging.info("No jobs found.")
+        logging.info("No new jobs found.")
+    
+    # Update missing emails
+    await update_missing_emails()
 
 if __name__ == "__main__":
     asyncio.run(main())
