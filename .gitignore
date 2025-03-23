@@ -1,0 +1,74 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs-info/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.txt
+*.whl
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+virtualenv/
+__pypackages__/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Environments
+.env
+.flaskenv
+
+# Coverage data
+.coverage
+coverage/
+.pytest_cache/
+
+# mypy cache
+.mypy_cache/
+
+# Poetry
+poetry.lock
+
+# pyproject.toml related files
+dist/
+build/
+
+# OS or Editor related files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.vscode/
+*.idea/
+*.tmproj/
+*.sublime-project
+*.sublime-workspace
