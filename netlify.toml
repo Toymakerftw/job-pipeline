@@ -2,3 +2,4 @@
   functions = "functions"
 [functions]
   node_bundler = "esbuild"
+  schedule = "0 0 * * *" # Runs daily at midnight UTC
