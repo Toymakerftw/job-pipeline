@@ -14,7 +14,7 @@ from dateutil.parser import parse as parse_date
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 from aiohttp import ClientSession, ClientTimeout
-from typing import Tuple, List, Optional, Set
+from typing import Tuple, List, Optional, Set, Dict, Any
 from google import genai
 from google.genai import types
 
@@ -148,7 +148,7 @@ def get_existing_links() -> Set[str]:
         logging.warning("Could not fetch existing links (DB might be empty or unreachable). Proceeding with full scrape.")
         return set()
 
-def extract_job_details_from_description(description: str) -> Dict[str, any]:
+def extract_job_details_from_description(description: str) -> Dict[str, Any]:
     """Extract structured information from job description using pattern matching."""
     details = {
         'experience_required': None,
