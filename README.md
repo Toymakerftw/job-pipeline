@@ -84,6 +84,9 @@ DB_USER=kljobs_user
 DB_PASSWORD=PX#lGJi5D68lH@
 DB_NAME=kljobs_db
 
+# Gemini API Configuration (For Data Cleaning)
+GEMINI_API_KEY=your_gemini_api_key_here
+
 # Target URLs (Optional)
 INFOPARK_URL=https://infopark.in/companies/job-search
 TECHNOPARK_URL=https://technopark.org/api/paginated-jobs

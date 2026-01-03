@@ -4,3 +4,4 @@ python-dotenv
 feedparser
 mysql-connector-python
 python-dateutil
+google-genai

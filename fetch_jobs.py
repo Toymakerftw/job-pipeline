@@ -15,6 +15,8 @@ from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 from aiohttp import ClientSession, ClientTimeout
 from typing import Tuple, List, Optional
+from google import genai
+from google.genai import types
 
 # Load environment variables
 load_dotenv()
@@ -24,6 +26,7 @@ INFOPARK_URL = os.getenv("INFOPARK_URL", "https://infopark.in/companies/job-sear
 TECHNOPARK_URL = os.getenv("TECHNOPARK_URL", "https://technopark.org/api/paginated-jobs")
 UL_URL = "https://www.ulcyberpark.com/jobs/index"
 CYBERPARK_RSS_URL = "https://www.cyberparkkerala.org/?feed=job_feed"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Database Configuration
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -77,9 +80,19 @@ def init_db() -> None:
                     tech_park TEXT,
                     description MEDIUMTEXT,
                     company_profile TEXT,
-                    email TEXT
+                    email TEXT,
+                    cleaned_data JSON,
+                    is_cleaned BOOLEAN DEFAULT FALSE
                 )
             """)
+            
+            # Check if columns exist (for migration)
+            cursor.execute("SHOW COLUMNS FROM jobs LIKE 'cleaned_data'")
+            if not cursor.fetchone():
+                cursor.execute("ALTER TABLE jobs ADD COLUMN cleaned_data JSON")
+                cursor.execute("ALTER TABLE jobs ADD COLUMN is_cleaned BOOLEAN DEFAULT FALSE")
+                logging.info("Added 'cleaned_data' and 'is_cleaned' columns.")
+
             logging.info("Database and table 'jobs' checked/initialized.")
             conn.commit()
             conn.close()
@@ -464,6 +477,108 @@ async def update_missing_emails() -> None:
         await asyncio.gather(*tasks)
     logging.info("Finished updating missing emails.")
 
+def clean_jobs_with_gemini():
+    """Clean job descriptions using Google Gemini API in batches."""
+    if not GEMINI_API_KEY:
+        logging.warning("GEMINI_API_KEY is not set. Skipping data cleaning.")
+        return
+
+    logging.info("Starting Gemini data cleaning (Batch Mode)...")
+    
+    BATCH_SIZE = 5
+    
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        
+        # Fetch a larger chunk of uncleaned jobs
+        cursor.execute("""
+            SELECT id, role, company, description, company_profile 
+            FROM jobs 
+            WHERE is_cleaned = FALSE 
+            LIMIT 50
+        """)
+        jobs_to_clean = cursor.fetchall()
+        
+        if not jobs_to_clean:
+            logging.info("No jobs pending cleaning.")
+            conn.close()
+            return
+
+        logging.info(f"Found {len(jobs_to_clean)} jobs to clean. Processing in batches of {BATCH_SIZE}...")
+
+        # Process in batches
+        for i in range(0, len(jobs_to_clean), BATCH_SIZE):
+            batch = jobs_to_clean[i : i + BATCH_SIZE]
+            batch_input = []
+            
+            for job in batch:
+                raw_text = f"Role: {job['role']}\nCompany: {job['company']}\nDescription: {job['description']}\nCompany Profile: {job['company_profile']}"
+                batch_input.append({
+                    "id": job['id'],
+                    "text": raw_text
+                })
+
+            prompt = """
+            You are a data cleaning assistant. I will provide a list of job descriptions.
+            For EACH job, extract and clean the data into a JSON object.
+            
+            Return a SINGLE JSON object where the keys are the provided "id"s and the values are the cleaned details.
+            
+            Format for each value:
+            {
+              "job_summary": "A short 2-sentence summary of the role",
+              "skills": ["skill1", "skill2"],
+              "experience_required": "e.g., '2-4 years' or 'Fresher'",
+              "clean_description": "The full description formatted in Markdown",
+              "clean_address": "Verified company address if available, else null",
+              "clean_email": "Contact email if available, else null"
+            }
+            
+            Input Data:
+            """ + json.dumps(batch_input)
+
+            try:
+                # Call Gemini API
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json"
+                    )
+                )
+                
+                # Parse the batch response
+                cleaned_batch = json.loads(response.text)
+                
+                update_cursor = conn.cursor()
+                
+                # Update each job in the batch
+                for job_id_str, cleaned_data in cleaned_batch.items():
+                    # Gemini might return ID as string, convert to ensure match
+                    cleaned_json_str = json.dumps(cleaned_data)
+                    
+                    update_cursor.execute(
+                        "UPDATE jobs SET cleaned_data = %s, is_cleaned = TRUE WHERE id = %s",
+                        (cleaned_json_str, job_id_str)
+                    )
+                
+                conn.commit()
+                logging.info(f"Processed batch of {len(cleaned_batch)} jobs.")
+                
+                # Sleep briefly to respect rate limits
+                time.sleep(2) 
+
+            except Exception as e:
+                logging.error(f"Error processing batch starting at index {i}: {e}")
+        
+        conn.close()
+        logging.info("Batch cleaning session completed.")
+
+    except Exception as e:
+        logging.error(f"Fatal error in cleaning process: {e}")
+
 async def main() -> None:
     """Main function to scrape and update jobs."""
     logging.info("Script is starting...")
@@ -490,6 +605,10 @@ async def main() -> None:
         logging.info("No new jobs found.")
     
     await update_missing_emails()
+    
+    # Run cleaning synchronously
+    clean_jobs_with_gemini()
+    
     logging.info("Script has completed.")
 
 if __name__ == "__main__":
