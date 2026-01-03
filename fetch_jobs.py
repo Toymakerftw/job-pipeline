@@ -6,11 +6,12 @@ import logging
 import os
 import re
 import json
+import feedparser
+from urllib.parse import urljoin
 from datetime import datetime
 from dateutil.parser import parse as parse_date  # Install python-dateutil if needed
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
-from supabase import create_client, Client
 from aiohttp import ClientSession, ClientTimeout
 from typing import Tuple, List, Optional
 
@@ -18,23 +19,12 @@ from typing import Tuple, List, Optional
 load_dotenv()
 INFOPARK_URL = os.getenv("INFOPARK_URL", "https://infopark.in/companies/job-search")
 TECHNOPARK_URL = os.getenv("TECHNOPARK_URL", "https://technopark.org/api/paginated-jobs")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+UL_URL = "https://www.ulcyberpark.com/jobs/index"
+CYBERPARK_RSS_URL = "https://www.cyberparkkerala.org/?feed=job_feed"
 DB_FILE = "jobs.db"
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-if not SUPABASE_URL or not SUPABASE_KEY:
-    logging.warning("Supabase URL or Key is missing. Supabase operations will fail.")
-
-# Initialize Supabase client
-try:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    logging.info("Supabase client initialized successfully.")
-except Exception as e:
-    logging.error(f"Failed to initialize Supabase client: {e}")
-    supabase = None
 
 def init_db() -> None:
     """Initialize SQLite database with jobs table. Use UNIQUE on 'link' to avoid duplicates."""
@@ -84,7 +74,7 @@ def is_deadline_in_future(deadline: str) -> bool:
         deadline_date = parse_date(deadline)
         return deadline_date >= datetime.now()
     except Exception as e:
-        logging.warning(f"Could not parse deadline '{deadline}': {e}. Assuming it's valid.")
+        # logging.warning(f"Could not parse deadline '{deadline}'. Assuming it's valid.")
         return True
 
 async def fetch(session: ClientSession, url: str, timeout: int = 30) -> Optional[str]:
@@ -115,7 +105,8 @@ async def get_infopark_job_details(session: ClientSession, job_link: str) -> Tup
     
     soup = BeautifulSoup(html, "html.parser")
     description_div = soup.find("div", class_="deatil-box")
-    description = description_div.get_text(strip=True) if description_div else ""
+    # Use separator to keep paragraphs distinct
+    description = description_div.get_text(separator="\n", strip=True) if description_div else ""
 
     company_id = job_link.split('/')[-1]
     company_profile_url = f"https://infopark.in/companies/profile/{company_id}"
@@ -128,14 +119,29 @@ async def get_infopark_job_details(session: ClientSession, job_link: str) -> Tup
             con_div = carer_box.find("div", class_="con")
             if con_div:
                 name = con_div.find("h4").get_text(strip=True) if con_div.find("h4") else ""
+                
+                # improved extraction
                 spans = con_div.find_all("span", recursive=False)
-                address = spans[0].get_text(separator="\n", strip=True) if len(spans) > 0 else ""
-                phone = spans[1].get_text(strip=True) if len(spans) > 1 else ""
-                email = spans[2].get_text(strip=True) if len(spans) > 2 else ""
+                address = ""
+                phone = ""
+                email = ""
                 website = ""
+
+                # Usually: [0] Address, [1] Phone, [2] Email, [3] Website
+                # But we should be careful.
+                if len(spans) > 0:
+                    address = spans[0].get_text(separator=" ", strip=True)
+                if len(spans) > 1:
+                    phone = spans[1].get_text(strip=True)
+                if len(spans) > 2:
+                    email = spans[2].get_text(strip=True)
                 if len(spans) > 3:
                     website_anchor = spans[3].find("a")
                     website = website_anchor.get_text(strip=True) if website_anchor else spans[3].get_text(strip=True)
+                
+                # Basic cleanup: If address contains "Contacts", it might be dirty.
+                # But the main fix is using separators above.
+                
                 company_profile = (
                     f"Company Name: {name}\n"
                     f"Address: {address}\n"
@@ -181,6 +187,116 @@ async def get_technopark_job_details(session: ClientSession, job_link: str) -> T
             email = a_tag["href"].replace("mailto:", "").strip()
 
     return description, company_profile, email
+
+async def scrape_ul_jobs() -> List[Tuple]:
+    """Scrape jobs from UL Cyberpark."""
+    logging.info("Started scraping jobs from UL Cyberpark...")
+    all_jobs = []
+    
+    async with aiohttp.ClientSession(timeout=ClientTimeout(total=30)) as session:
+        current_url = UL_URL
+        while current_url:
+            logging.info(f"Fetching {current_url}")
+            html = await fetch(session, current_url)
+            if not html:
+                break
+            
+            soup = BeautifulSoup(html, 'html.parser')
+            table_div = soup.find('div', class_='table-responsive-sm table-job')
+            if not table_div:
+                break
+            table = table_div.find('table', class_='table')
+            if not table:
+                break
+
+            for row in table.find_all('tr'):
+                tds = row.find_all('td')
+                if len(tds) < 3:
+                    continue
+                
+                # Extract details
+                job_title_elem = tds[0].find('a', class_='btn-1')
+                role = job_title_elem.text.strip() if job_title_elem else 'N/A'
+                
+                closing_date_elem = tds[0].find('span')
+                deadline = 'N/A'
+                if closing_date_elem:
+                    deadline = closing_date_elem.text.split('closing date: ')[-1].strip()
+                
+                company_elem = tds[1].find('a', class_='btn-1')
+                company = company_elem.text.strip() if company_elem else 'N/A'
+                
+                # For link, we prefer the 'Details' page as it is unique to the job
+                details_elem = tds[2].find('a')
+                link = details_elem.get('href', 'N/A') if details_elem else 'N/A'
+                if link != 'N/A' and not link.startswith('http'):
+                    link = urljoin(UL_URL, link)
+                
+                # Placeholder for now, could fetch deep details if needed
+                description = f"Job at {company}. See link for details."
+                company_profile = f"Company: {company}"
+                email = ""
+
+                if is_deadline_in_future(deadline):
+                    all_jobs.append((company, role, deadline, link, "UL Cyberpark", description, company_profile, email))
+            
+            # Pagination
+            next_link = None
+            pagination = soup.find(lambda tag: tag.name in ['ul', 'section'] and 
+                                     tag.get('class') and any('pagination' in cls for cls in tag.get('class')))
+            if pagination:
+                next_a = pagination.find('a', rel='next')
+                if not next_a:
+                    active_li = pagination.find('li', class_='active')
+                    if active_li:
+                        next_li = active_li.find_next_sibling('li')
+                        if next_li:
+                            next_a = next_li.find('a')
+                
+                if next_a and next_a.get('href'):
+                    next_link = next_a['href']
+                    if not next_link.startswith('http'):
+                        next_link = urljoin(UL_URL, next_link)
+            
+            current_url = next_link
+            
+    logging.info(f"Finished scraping jobs from UL Cyberpark. Found {len(all_jobs)} jobs.")
+    return all_jobs
+
+def scrape_cyberpark_rss() -> List[Tuple]:
+    """Scrape jobs from Cyberpark Kerala RSS Feed."""
+    logging.info("Started scraping jobs from Cyberpark RSS...")
+    all_jobs = []
+    try:
+        feed = feedparser.parse(CYBERPARK_RSS_URL)
+        for entry in feed.entries:
+            role = entry.title
+            company = "Cyberpark Company" # Placeholder, sometimes in title or summary
+            deadline = entry.published if hasattr(entry, 'published') else "N/A"
+            link = entry.link
+            description = entry.summary if hasattr(entry, 'summary') else ""
+            
+            # Try to extract cleaner company name from title if " - " exists
+            if " - " in role:
+                parts = role.split(" - ")
+                if len(parts) >= 2:
+                    role = parts[0].strip()
+                    company = parts[1].strip()
+            
+            # Basic cleanup of HTML in summary for description
+            clean_desc = BeautifulSoup(description, "html.parser").get_text(separator="\n", strip=True)
+            
+            company_profile = f"Company: {company}"
+            email = ""
+            
+            # RSS items are usually recent, assume valid deadline or unknown
+            all_jobs.append((company, role, deadline, link, "Cyberpark Kozhikode", clean_desc, company_profile, email))
+            
+    except Exception as e:
+        logging.error(f"Error parsing RSS feed: {e}")
+        
+    logging.info(f"Finished scraping jobs from Cyberpark RSS. Found {len(all_jobs)} jobs.")
+    return all_jobs
 
 async def scrape_jobs(base_url: str, tech_park: str, max_concurrent_requests: int = 10) -> List[Tuple]:
     """Scrape jobs from the specified tech park."""
@@ -259,33 +375,6 @@ def save_jobs_to_db(jobs: List[Tuple]) -> None:
     except Exception as e:
         logging.error(f"Error saving jobs to database: {e}")
 
-def save_jobs_to_supabase(jobs: List[Tuple]) -> None:
-    """Save jobs to Supabase database."""
-    if not supabase:
-        logging.error("Supabase client not initialized. Skipping Supabase save.")
-        return
-    jobs_dict_list = [
-        {
-            "company": job[0],
-            "role": job[1],
-            "deadline": job[2],
-            "link": job[3],
-            "tech_park": job[4],
-            "description": job[5],
-            "company_profile": job[6],
-            "email": job[7]
-        }
-        for job in jobs
-    ]
-    try:
-        response = supabase.table('jobs').insert(jobs_dict_list).execute()
-        if hasattr(response, 'error') and response.error:
-            logging.error(f"Failed to insert jobs into Supabase: {response.error}")
-        else:
-            logging.info(f"Saved {len(jobs)} jobs to Supabase.")
-    except Exception as e:
-        logging.error(f"Exception during Supabase insertion: {e}")
-
 async def update_missing_emails() -> None:
     """Update jobs with missing emails."""
     logging.info("Starting update of missing emails...")
@@ -307,6 +396,10 @@ async def update_missing_emails() -> None:
         for job in jobs_missing_email:
             job_link = job[3]
             tech_park = job[4]
+            # Skip email update for UL/RSS for now as they don't have detail scrapers set up in this specific function yet
+            if tech_park not in ["Infopark", "Technopark"]:
+                continue
+                
             async def process_job(job_link, tech_park):
                 async with semaphore:
                     if tech_park == "Infopark":
@@ -323,8 +416,6 @@ async def update_missing_emails() -> None:
                             cursor.execute("UPDATE jobs SET email = ? WHERE link = ?", (email, job_link))
                             conn.commit()
                             conn.close()
-                            if supabase:
-                                supabase.table('jobs').update({"email": email}).match({"link": job_link}).execute()
                             logging.info(f"Updated job: {job_link} with email: {email}")
                         except Exception as e:
                             logging.error(f"Error updating email for {job_link}: {e}")
@@ -337,13 +428,22 @@ async def main() -> None:
     logging.info("Script is starting...")
     init_db()
     
-    infopark_jobs = await scrape_jobs(INFOPARK_URL, "Infopark")
-    technopark_jobs = await scrape_jobs(TECHNOPARK_URL, "Technopark")
-    all_jobs = infopark_jobs + technopark_jobs
+    # Run independent scrape tasks
+    infopark_task = scrape_jobs(INFOPARK_URL, "Infopark")
+    technopark_task = scrape_jobs(TECHNOPARK_URL, "Technopark")
+    ul_task = scrape_ul_jobs()
+    
+    # RSS is sync, run it directly
+    rss_jobs = scrape_cyberpark_rss()
+    
+    # Gather async results
+    results = await asyncio.gather(infopark_task, technopark_task, ul_task)
+    infopark_jobs, technopark_jobs, ul_jobs = results
+    
+    all_jobs = infopark_jobs + technopark_jobs + ul_jobs + rss_jobs
 
     if all_jobs:
         save_jobs_to_db(all_jobs)
-        save_jobs_to_supabase(all_jobs)
         logging.info(f"Scraped and saved {len(all_jobs)} jobs in total.")
     else:
         logging.info("No new jobs found.")
