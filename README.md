@@ -1,75 +1,79 @@
-```markdown
-# techpark-jobs-pipeline
+# Techpark Jobs Pipeline 🚀
 
-This Python script scrapes job postings from the Infopark and Technopark websites, extracts relevant details, and stores them in a SQLite database. This project is designed with potential DevOps practices in mind, aiming for automation and efficient data handling.
+A robust, asynchronous Python scraper that aggregates job listings from major IT parks in Kerala (Infopark, Technopark, UL Cyberpark, and Cyberpark Kozhikode) into a single SQLite database.
+
+## Features
+
+- **Multi-Source Aggregation**: Fetches data from Infopark, Technopark, UL Cyberpark, and Cyberpark RSS feeds.
+- **Asynchronous Scraping**: Built with `aiohttp` and `asyncio` for high-performance data retrieval.
+- **Data Persistence**: Stores job details, company profiles, and contact emails in a local SQLite database (`jobs.db`).
+- **Deduplication**: Uses unique job links to ensure no duplicate entries are stored.
+- **Clean Text**: Improved parsing logic to preserve formatting and readability in job descriptions.
+- **Dockerized**: Ready for deployment on any server using Docker and Docker Compose.
 
 ## Prerequisites
 
--   Python 3.7+
--   `aiohttp`
--   `beautifulsoup4`
--   `python-dotenv`
--   `sqlite3`
+- Python 3.9+ (if running locally)
+- Docker & Docker Compose (for containerized execution)
 
-You can install the required packages using pip:
+## Setup & Usage
 
-```bash
-pip install aiohttp beautifulsoup4 python-dotenv
-```
+### Local Execution
 
-## Setup
+1. **Install Dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-1.  **Clone the repository:**
+2. **Run the Scraper**:
+   ```bash
+   python fetch_jobs.py
+   ```
 
-    ```bash
-    git clone <repository_url>
-    cd techpark-jobs-pipeline
-    ```
+### Docker Execution (Recommended)
 
-2.  **Create a `.env` file:**
+Running with Docker ensures all dependencies are correctly managed and allows for easy scheduling via cron on a server.
 
-    Create a `.env` file in the root directory of the project and add the following environment variables:
+1. **Build the Container**:
+   ```bash
+   docker-compose build
+   ```
 
-    ```
-    INFOPARK_URL=[https://infopark.in/companies/job-search](https://infopark.in/companies/job-search)
-    TECHNOPARK_URL=[https://technopark.org/api/paginated-jobs](https://technopark.org/api/paginated-jobs)
-    ```
-
-    (If you are using the default urls, this step is optional.)
-
-3.  **Run the script:**
-
-    ```bash
-    python scraper.py
-    ```
-
-    This will create a `jobs.db` SQLite database file and populate it with job postings.
+2. **Run the Scraper**:
+   ```bash
+   docker-compose up
+   ```
+   *Note: The `jobs.db` file is volume-mounted, so your data persists on the host machine even after the container stops.*
 
 ## Database Schema
 
-The `jobs.db` database contains a `jobs` table with the following schema:
+The `jobs.db` database contains a `jobs` table with the following structure:
 
-| Column          | Type    | Description                               |
-| --------------- | ------- | ----------------------------------------- |
-| `id`            | INTEGER | Primary key, auto-incrementing            |
-| `company`       | TEXT    | Company name                              |
-| `role`          | TEXT    | Job role                                  |
-| `deadline`      | TEXT    | Application deadline                      |
-| `link`          | TEXT    | Link to the job posting                   |
-| `tech_park`     | TEXT    | Technology park (Infopark or Technopark) |
-| `description`   | TEXT    | Job description                           |
-| `company_profile` | TEXT    | Company profile details                  |
+| Column | Type | Description |
+| :--- | :--- | :--- |
+| `id` | INTEGER | Primary key |
+| `company` | TEXT | Name of the hiring company |
+| `role` | TEXT | Job title / Role |
+| `deadline` | TEXT | Application deadline |
+| `link` | TEXT | UNIQUE URL to the job posting |
+| `tech_park` | TEXT | Source (e.g., Infopark, Technopark) |
+| `description`| TEXT | Full job description |
+| `company_profile` | TEXT | Address and contact details |
+| `email` | TEXT | Extracted contact email |
 
-## Logging
+## Configuration
 
-The script uses the `logging` module to log informational messages and errors. Logs are written to the console.
+You can override the default target URLs by creating a `.env` file in the root directory:
 
-## Usage
+```env
+INFOPARK_URL=https://infopark.in/companies/job-search
+TECHNOPARK_URL=https://technopark.org/api/paginated-jobs
+```
 
-After running the script, you can use any SQLite browser or Python's `sqlite3` module to query the `jobs.db` database.
+## Scheduling
 
-Example query to get all jobs from Infopark:
+To run this as a daily cron job on a Linux server:
 
-```sql
-SELECT * FROM jobs WHERE tech_park = 'Infopark';
+```bash
+0 0 * * * cd /path/to/project && /usr/local/bin/docker-compose up > /dev/null 2>&1
 ```
