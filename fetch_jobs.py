@@ -14,7 +14,7 @@ from dateutil.parser import parse as parse_date
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 from aiohttp import ClientSession, ClientTimeout
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Set
 from google import genai
 from google.genai import types
 
@@ -105,6 +105,20 @@ def init_db() -> None:
             else:
                 logging.error("Max retries reached. Could not connect to database.")
                 raise
+
+def get_existing_links() -> Set[str]:
+    """Fetch all existing job links from the database to avoid re-scraping."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT link FROM jobs")
+        links = {row[0] for row in cursor.fetchall()}
+        conn.close()
+        logging.info(f"Loaded {len(links)} existing jobs from database.")
+        return links
+    except mysql.connector.Error:
+        logging.warning("Could not fetch existing links (DB might be empty or unreachable). Proceeding with full scrape.")
+        return set()
 
 def format_description(description: str) -> str:
     """Normalize whitespace in the job description."""
@@ -234,7 +248,7 @@ async def get_technopark_job_details(session: ClientSession, job_link: str) -> T
 
     return description, company_profile, email
 
-async def scrape_ul_jobs() -> List[Tuple]:
+async def scrape_ul_jobs(existing_links: Set[str]) -> List[Tuple]:
     """Scrape jobs from UL Cyberpark."""
     logging.info("Started scraping jobs from UL Cyberpark...")
     all_jobs = []
@@ -261,6 +275,15 @@ async def scrape_ul_jobs() -> List[Tuple]:
                     continue
                 
                 # Extract details
+                # For link, we prefer the 'Details' page as it is unique to the job
+                details_elem = tds[2].find('a')
+                link = details_elem.get('href', 'N/A') if details_elem else 'N/A'
+                if link != 'N/A' and not link.startswith('http'):
+                    link = urljoin(UL_URL, link)
+                
+                if link in existing_links:
+                    continue
+
                 job_title_elem = tds[0].find('a', class_='btn-1')
                 role = job_title_elem.text.strip() if job_title_elem else 'N/A'
                 
@@ -271,12 +294,6 @@ async def scrape_ul_jobs() -> List[Tuple]:
                 
                 company_elem = tds[1].find('a', class_='btn-1')
                 company = company_elem.text.strip() if company_elem else 'N/A'
-                
-                # For link, we prefer the 'Details' page as it is unique to the job
-                details_elem = tds[2].find('a')
-                link = details_elem.get('href', 'N/A') if details_elem else 'N/A'
-                if link != 'N/A' and not link.startswith('http'):
-                    link = urljoin(UL_URL, link)
                 
                 # Placeholder for now, could fetch deep details if needed
                 description = f"Job at {company}. See link for details."
@@ -306,20 +323,23 @@ async def scrape_ul_jobs() -> List[Tuple]:
             
             current_url = next_link
             
-    logging.info(f"Finished scraping jobs from UL Cyberpark. Found {len(all_jobs)} jobs.")
+    logging.info(f"Finished scraping jobs from UL Cyberpark. Found {len(all_jobs)} new jobs.")
     return all_jobs
 
-def scrape_cyberpark_rss() -> List[Tuple]:
+def scrape_cyberpark_rss(existing_links: Set[str]) -> List[Tuple]:
     """Scrape jobs from Cyberpark Kerala RSS Feed."""
     logging.info("Started scraping jobs from Cyberpark RSS...")
     all_jobs = []
     try:
         feed = feedparser.parse(CYBERPARK_RSS_URL)
         for entry in feed.entries:
+            link = entry.link
+            if link in existing_links:
+                continue
+
             role = entry.title
             company = "Cyberpark Company" # Placeholder, sometimes in title or summary
             deadline = entry.published if hasattr(entry, 'published') else "N/A"
-            link = entry.link
             description = entry.summary if hasattr(entry, 'summary') else ""
             
             # Try to extract cleaner company name from title if " - " exists
@@ -341,10 +361,10 @@ def scrape_cyberpark_rss() -> List[Tuple]:
     except Exception as e:
         logging.error(f"Error parsing RSS feed: {e}")
         
-    logging.info(f"Finished scraping jobs from Cyberpark RSS. Found {len(all_jobs)} jobs.")
+    logging.info(f"Finished scraping jobs from Cyberpark RSS. Found {len(all_jobs)} new jobs.")
     return all_jobs
 
-async def scrape_jobs(base_url: str, tech_park: str, max_concurrent_requests: int = 10) -> List[Tuple]:
+async def scrape_jobs(base_url: str, tech_park: str, existing_links: Set[str], max_concurrent_requests: int = 10) -> List[Tuple]:
     """Scrape jobs from the specified tech park."""
     logging.info(f"Started scraping jobs from {tech_park}...")
     async with aiohttp.ClientSession(timeout=ClientTimeout(total=30)) as session:
@@ -360,11 +380,17 @@ async def scrape_jobs(base_url: str, tech_park: str, max_concurrent_requests: in
             jobs_in_page = []
             if tech_park == "Infopark":
                 soup = BeautifulSoup(html_or_json, "html.parser")
-                for row in soup.select("#job-list tbody tr"):
+                rows = soup.select("#job-list tbody tr")
+                if not rows:
+                    break
+                for row in rows:
+                    job_link = row.select_one("td.btn-sec a")["href"] if row.select_one("td.btn-sec a") else ""
+                    if job_link in existing_links:
+                        continue
+                        
                     job_role = row.select_one("td.head").get_text(strip=True)
                     company = row.select_one("td.date").get_text(strip=True)
                     deadline = row.select_one("td:nth-child(3)").get_text(strip=True)
-                    job_link = row.select_one("td.btn-sec a")["href"] if row.select_one("td.btn-sec a") else ""
                     jobs_in_page.append((company, job_role, deadline, job_link))
                 has_next_page = bool(soup.select_one("li.page-item a[rel='next']"))
             elif tech_park == "Technopark":
@@ -372,14 +398,25 @@ async def scrape_jobs(base_url: str, tech_park: str, max_concurrent_requests: in
                 if not data.get("data"):
                     break
                 for job in data["data"]:
+                    job_link = f"https://technopark.org/job-details/{job['id']}"
+                    if job_link in existing_links:
+                        continue
+                    
                     company = job["company"]["company"]
                     job_role = job["job_title"]
                     deadline = job["closing_date"]
-                    job_link = f"https://technopark.org/job-details/{job['id']}"
                     jobs_in_page.append((company, job_role, deadline, job_link))
                 has_next_page = data.get("current_page", 0) < data.get("last_page", 0)
+            
+            # Optimization: Stop if all jobs on current page are duplicates (and not page 1)
             if not jobs_in_page:
-                break
+                if page > 1:
+                    logging.info(f"All jobs on page {page} are duplicates. Stopping scrape for {tech_park}.")
+                    break
+                if page == 1 and html_or_json:
+                    logging.info(f"All jobs on page 1 are duplicates. No new jobs at {tech_park}.")
+                    break
+
             tasks = []
             for company, role, deadline, link in jobs_in_page:
                 if tech_park == "Infopark":
@@ -584,13 +621,15 @@ async def main() -> None:
     logging.info("Script is starting...")
     init_db()
     
-    # Run independent scrape tasks
-    infopark_task = scrape_jobs(INFOPARK_URL, "Infopark")
-    technopark_task = scrape_jobs(TECHNOPARK_URL, "Technopark")
-    ul_task = scrape_ul_jobs()
+    existing_links = get_existing_links()
+    
+    # Run independent scrape tasks with existing_links passed
+    infopark_task = scrape_jobs(INFOPARK_URL, "Infopark", existing_links)
+    technopark_task = scrape_jobs(TECHNOPARK_URL, "Technopark", existing_links)
+    ul_task = scrape_ul_jobs(existing_links)
     
     # RSS is sync, run it directly
-    rss_jobs = scrape_cyberpark_rss()
+    rss_jobs = scrape_cyberpark_rss(existing_links)
     
     # Gather async results
     results = await asyncio.gather(infopark_task, technopark_task, ul_task)
