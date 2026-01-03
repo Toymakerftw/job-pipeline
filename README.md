@@ -7,8 +7,12 @@ A robust, asynchronous Python scraper that aggregates job listings from major IT
 - **Multi-Source Aggregation**: Fetches data from Infopark, Technopark, UL Cyberpark, and Cyberpark RSS feeds.
 - **Asynchronous Scraping**: Built with `aiohttp` and `asyncio` for high-performance data retrieval.
 - **Data Persistence**: Stores job details, company profiles, and contact emails in a MySQL database.
-- **Deduplication**: Uses unique job links to ensure no duplicate entries are stored.
+- **Smart Deduplication**: Uses unique job links and content similarity detection to avoid duplicate entries.
 - **Clean Text**: Improved parsing logic to preserve formatting and readability in job descriptions.
+- **Configurable Sources**: Enable/disable specific job sources via environment variables.
+- **Detailed Statistics**: Tracks and reports scraping statistics including source breakdown and execution time.
+- **Intelligent Data Extraction**: Automatically extracts structured information like experience, skills, and job type from job descriptions.
+- **Robust Error Handling**: Comprehensive error handling and logging with file output.
 - **Dockerized**: Ready for deployment on any server using Docker and Docker Compose.
 
 ## Prerequisites
@@ -90,6 +94,23 @@ GEMINI_API_KEY=your_gemini_api_key_here
 # Target URLs (Optional)
 INFOPARK_URL=https://infopark.in/companies/job-search
 TECHNOPARK_URL=https://technopark.org/api/paginated-jobs
+UL_URL=https://www.ulcyberpark.com/jobs/index
+CYBERPARK_RSS_URL=https://www.cyberparkkerala.org/?feed=job_feed
+
+# Scraper Configuration - Enable/disable specific sources
+ENABLE_INFOPARK=true
+ENABLE_TECHNOPARK=true
+ENABLE_UL=true
+ENABLE_CYBERPARK_RSS=true
+
+# Scraping Configuration
+MAX_CONCURRENT_REQUESTS=10
+REQUEST_TIMEOUT=30
+SCRAPE_DELAY=0.5
+
+# Job Filtering Configuration
+FILTER_EXPIRED_JOBS=true
+MAX_DAYS_TO_DEADLINE=0  # 0 means no limit, positive number sets max days from now
 ```
 
 ## Scheduling
