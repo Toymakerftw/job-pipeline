@@ -1,12 +1,31 @@
 services:
+  db:
+    image: mysql:8.0
+    container_name: kljobs_db_container
+    command: --default-authentication-plugin=mysql_native_password
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: kljobs_db
+      MYSQL_USER: kljobs_user
+      MYSQL_PASSWORD: PX#lGJi5D68lH@
+    ports:
+      - "3306:3306"  # Exposed to Host:3306 for Vercel connection
+    volumes:
+      - db_data:/var/lib/mysql
+
   job-scraper:
     build: .
     container_name: job-scraper
-    volumes:
-      - ./jobs.db:/app/jobs.db
-    # Environment variables can be added here or in a .env file
-    # env_file:
-    #   - .env
-    # environment:
-    #   - INFOPARK_URL=https://infopark.in/companies/job-search
-    #   - TECHNOPARK_URL=https://technopark.org/api/paginated-jobs
+    depends_on:
+      - db
+    environment:
+      - DB_HOST=db  # Connects to the 'db' service name internally
+      - DB_USER=kljobs_user
+      - DB_PASSWORD=PX#lGJi5D68lH@
+      - DB_NAME=kljobs_db
+      - INFOPARK_URL=https://infopark.in/companies/job-search
+      - TECHNOPARK_URL=https://technopark.org/api/paginated-jobs
+
+volumes:
+  db_data:

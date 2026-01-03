@@ -1,15 +1,16 @@
 import asyncio
 import ssl
 import aiohttp
-import sqlite3
+import mysql.connector
 import logging
 import os
 import re
+import time
 import json
 import feedparser
 from urllib.parse import urljoin
 from datetime import datetime
-from dateutil.parser import parse as parse_date  # Install python-dateutil if needed
+from dateutil.parser import parse as parse_date
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 from aiohttp import ClientSession, ClientTimeout
@@ -17,48 +18,80 @@ from typing import Tuple, List, Optional
 
 # Load environment variables
 load_dotenv()
+
+# Configuration
 INFOPARK_URL = os.getenv("INFOPARK_URL", "https://infopark.in/companies/job-search")
 TECHNOPARK_URL = os.getenv("TECHNOPARK_URL", "https://technopark.org/api/paginated-jobs")
 UL_URL = "https://www.ulcyberpark.com/jobs/index"
 CYBERPARK_RSS_URL = "https://www.cyberparkkerala.org/?feed=job_feed"
-DB_FILE = "jobs.db"
+
+# Database Configuration
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_USER = os.getenv("DB_USER", "kljobs_user")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "PX#lGJi5D68lH@")
+DB_NAME = os.getenv("DB_NAME", "kljobs_db")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+def get_db_connection():
+    """Establish a connection to the MySQL database."""
+    return mysql.connector.connect(
+        host=DB_HOST,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        database=DB_NAME
+    )
+
 def init_db() -> None:
-    """Initialize SQLite database with jobs table. Use UNIQUE on 'link' to avoid duplicates."""
-    abs_db_path = os.path.abspath(DB_FILE)
-    logging.info(f"Initializing database at {abs_db_path}")
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    # Create table with UNIQUE constraint on link if it doesn't exist.
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='jobs'")
-    if cursor.fetchone() is None:
-        cursor.execute("""
-            CREATE TABLE jobs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                company TEXT,
-                role TEXT,
-                deadline TEXT,
-                link TEXT UNIQUE,
-                tech_park TEXT,
-                description TEXT,
-                company_profile TEXT,
-                email TEXT
+    """Initialize MySQL database and table. Retries connection if DB is not ready."""
+    logging.info(f"Initializing database {DB_NAME} on {DB_HOST}...")
+    
+    max_retries = 10
+    retry_delay = 5
+    
+    for attempt in range(max_retries):
+        try:
+            # Connect to MySQL server first to create DB if needed
+            conn = mysql.connector.connect(
+                host=DB_HOST,
+                user=DB_USER,
+                password=DB_PASSWORD
             )
-        """)
-        logging.info("Created table 'jobs' with UNIQUE 'link' column.")
-    else:
-        # Optionally, check for missing columns (like email) and add them.
-        cursor.execute("PRAGMA table_info(jobs)")
-        columns = [col[1] for col in cursor.fetchall()]
-        if 'email' not in columns:
-            cursor.execute("ALTER TABLE jobs ADD COLUMN email TEXT")
-            logging.info("Added missing 'email' column to 'jobs' table.")
-    conn.commit()
-    conn.close()
-    logging.info("Database initialization complete.")
+            cursor = conn.cursor()
+            cursor.execute(f"CREATE DATABASE IF NOT EXISTS {DB_NAME}")
+            conn.close()
+
+            # Now connect to the specific database
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            # Create table with UNIQUE constraint on link
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS jobs (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    company TEXT,
+                    role TEXT,
+                    deadline TEXT,
+                    link VARCHAR(255) UNIQUE,
+                    tech_park TEXT,
+                    description MEDIUMTEXT,
+                    company_profile TEXT,
+                    email TEXT
+                )
+            """)
+            logging.info("Database and table 'jobs' checked/initialized.")
+            conn.commit()
+            conn.close()
+            return # Success
+        except mysql.connector.Error as err:
+            logging.warning(f"Database connection attempt {attempt + 1}/{max_retries} failed: {err}")
+            if attempt < max_retries - 1:
+                logging.info(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+            else:
+                logging.error("Max retries reached. Could not connect to database.")
+                raise
 
 def format_description(description: str) -> str:
     """Normalize whitespace in the job description."""
@@ -360,33 +393,40 @@ async def scrape_jobs(base_url: str, tech_park: str, max_concurrent_requests: in
         return all_jobs
 
 def save_jobs_to_db(jobs: List[Tuple]) -> None:
-    """Save jobs to SQLite database using INSERT OR IGNORE to avoid duplicates."""
+    """Save jobs to MySQL database using INSERT IGNORE to avoid duplicates."""
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.executemany("""
-            INSERT OR IGNORE INTO jobs
+        # MySQL uses %s for placeholders
+        query = """
+            INSERT IGNORE INTO jobs
             (company, role, deadline, link, tech_park, description, company_profile, email)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, jobs)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        cursor.executemany(query, jobs)
         conn.commit()
+        logging.info(f"Saved {cursor.rowcount} new jobs to MySQL database.")
         conn.close()
-        logging.info(f"Saved {cursor.rowcount} new jobs to SQLite database.")
-    except Exception as e:
-        logging.error(f"Error saving jobs to database: {e}")
+    except mysql.connector.Error as err:
+        logging.error(f"Error saving jobs to database: {err}")
 
 async def update_missing_emails() -> None:
     """Update jobs with missing emails."""
     logging.info("Starting update of missing emails...")
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT company, role, deadline, link, tech_park, description, company_profile, email
-        FROM jobs
-        WHERE (email IS NULL OR TRIM(email) = '')
-    """)
-    jobs_missing_email = cursor.fetchall()
-    conn.close()
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT company, role, deadline, link, tech_park, description, company_profile, email
+            FROM jobs
+            WHERE (email IS NULL OR TRIM(email) = '')
+        """)
+        jobs_missing_email = cursor.fetchall()
+        conn.close()
+    except mysql.connector.Error as err:
+        logging.error(f"Error fetching jobs for email update: {err}")
+        return
+
     if not jobs_missing_email:
         logging.info("No jobs with missing emails found.")
         return
@@ -394,6 +434,7 @@ async def update_missing_emails() -> None:
         semaphore = asyncio.Semaphore(10)
         tasks = []
         for job in jobs_missing_email:
+            # MySQL result is a tuple, indexes should be same as select
             job_link = job[3]
             tech_park = job[4]
             # Skip email update for UL/RSS for now as they don't have detail scrapers set up in this specific function yet
@@ -411,9 +452,9 @@ async def update_missing_emails() -> None:
                         _, _, email = await get_technopark_job_details(session, job_link)
                     if email:
                         try:
-                            conn = sqlite3.connect(DB_FILE)
+                            conn = get_db_connection()
                             cursor = conn.cursor()
-                            cursor.execute("UPDATE jobs SET email = ? WHERE link = ?", (email, job_link))
+                            cursor.execute("UPDATE jobs SET email = %s WHERE link = %s", (email, job_link))
                             conn.commit()
                             conn.close()
                             logging.info(f"Updated job: {job_link} with email: {email}")
