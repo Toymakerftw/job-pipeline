@@ -91,6 +91,10 @@ DB_NAME=kljobs_db
 # Gemini API Configuration (For Data Cleaning)
 GEMINI_API_KEY=your_gemini_api_key_here
 
+# OpenRouter Configuration (Optional, for load balancing)
+# Provide comma-separated keys. The system rotates between Gemini and these keys.
+OPENROUTER_API_KEYS=key1,key2,key3
+
 # Target URLs (Optional)
 INFOPARK_URL=https://infopark.in/companies/job-search
 TECHNOPARK_URL=https://technopark.org/api/paginated-jobs

@@ -17,6 +17,7 @@ from aiohttp import ClientSession, ClientTimeout
 from typing import Tuple, List, Optional, Set, Dict, Any
 from google import genai
 from google.genai import types
+import openai
 
 # Load environment variables
 load_dotenv()
@@ -26,7 +27,11 @@ INFOPARK_URL = os.getenv("INFOPARK_URL", "https://infopark.in/companies/job-sear
 TECHNOPARK_URL = os.getenv("TECHNOPARK_URL", "https://technopark.org/api/paginated-jobs")
 UL_URL = os.getenv("UL_URL", "https://www.ulcyberpark.com/jobs/index")
 CYBERPARK_RSS_URL = os.getenv("CYBERPARK_RSS_URL", "https://www.cyberparkkerala.org/?feed=job_feed")
+
+# API Keys
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OPENROUTER_API_KEYS = os.getenv("OPENROUTER_API_KEYS", "").split(",")
+OPENROUTER_API_KEYS = [k.strip() for k in OPENROUTER_API_KEYS if k.strip()]
 
 # Scraper Configuration
 ENABLE_INFOPARK = os.getenv("ENABLE_INFOPARK", "true").lower() == "true"
@@ -329,8 +334,6 @@ async def get_infopark_job_details(session: ClientSession, job_link: str) -> Tup
                 email = ""
                 website = ""
 
-                # Usually: [0] Address, [1] Phone, [2] Email, [3] Website
-                # But we should be careful.
                 if len(spans) > 0:
                     address = spans[0].get_text(separator=" ", strip=True)
                 if len(spans) > 1:
@@ -340,9 +343,6 @@ async def get_infopark_job_details(session: ClientSession, job_link: str) -> Tup
                 if len(spans) > 3:
                     website_anchor = spans[3].find("a")
                     website = website_anchor.get_text(strip=True) if website_anchor else spans[3].get_text(strip=True)
-                
-                # Basic cleanup: If address contains "Contacts", it might be dirty.
-                # But the main fix is using separators above.
                 
                 company_profile = (
                     f"Company Name: {name}\n"
@@ -394,7 +394,7 @@ async def scrape_ul_jobs(existing_links: Set[str]) -> List[Tuple]:
     """Scrape jobs from UL Cyberpark."""
     logging.info("Started scraping jobs from UL Cyberpark...")
     all_jobs = []
-    consecutive_empty_pages = 0  # Track consecutive empty pages to avoid infinite loops
+    consecutive_empty_pages = 0
 
     async with aiohttp.ClientSession(timeout=ClientTimeout(total=30)) as session:
         current_url = UL_URL
@@ -425,8 +425,6 @@ async def scrape_ul_jobs(existing_links: Set[str]) -> List[Tuple]:
                         if len(tds) < 3:
                             continue
 
-                        # Extract details
-                        # For link, we prefer the 'Details' page as it is unique to the job
                         details_elem = tds[2].find('a')
                         link = details_elem.get('href', 'N/A') if details_elem else 'N/A'
                         if link != 'N/A' and not link.startswith('http'):
@@ -442,14 +440,12 @@ async def scrape_ul_jobs(existing_links: Set[str]) -> List[Tuple]:
                         deadline = 'N/A'
                         if closing_date_elem:
                             deadline = closing_date_elem.get_text(strip=True)
-                            # Extract date from text like "closing date: 2023-12-31"
                             if 'closing date:' in deadline.lower():
                                 deadline = deadline.split('closing date:')[-1].strip()
 
                         company_elem = tds[1].find('a', class_='btn-1')
                         company = company_elem.get_text(strip=True) if company_elem else 'N/A'
 
-                        # Placeholder for now, could fetch deep details if needed
                         description = f"Job at {company}. See link for details."
                         company_profile = f"Company: {company}"
                         email = ""
@@ -467,9 +463,8 @@ async def scrape_ul_jobs(existing_links: Set[str]) -> List[Tuple]:
                     consecutive_empty_pages += 1
                     logging.info(f"No new jobs found on page, consecutive empty pages: {consecutive_empty_pages}")
                 else:
-                    consecutive_empty_pages = 0  # Reset if we found jobs
+                    consecutive_empty_pages = 0
 
-                # Pagination
                 next_link = None
                 pagination = soup.find(lambda tag: tag.name in ['ul', 'section'] and
                                          tag.get('class') and any('pagination' in cls for cls in tag.get('class')))
@@ -514,24 +509,20 @@ def scrape_cyberpark_rss(existing_links: Set[str]) -> List[Tuple]:
                     continue
 
                 role = entry.title if hasattr(entry, 'title') else "N/A"
-                company = "Cyberpark Company" # Placeholder, sometimes in title or summary
+                company = "Cyberpark Company" # Placeholder
                 deadline = entry.published if hasattr(entry, 'published') else "N/A"
                 description = entry.summary if hasattr(entry, 'summary') else ""
-
-                # Try to extract cleaner company name from title if " - " exists
+                
                 if " - " in role:
                     parts = role.split(" - ")
                     if len(parts) >= 2:
                         role = parts[0].strip()
                         company = parts[1].strip()
-
-                # Basic cleanup of HTML in summary for description
+                
                 clean_desc = BeautifulSoup(description, "html.parser").get_text(separator="\n", strip=True)
-
                 company_profile = f"Company: {company}"
                 email = ""
-
-                # RSS items are usually recent, assume valid deadline or unknown
+                
                 all_jobs.append((company, role, deadline, link, "Cyberpark Kozhikode", clean_desc, company_profile, email))
             except Exception as e:
                 logging.error(f"Error processing RSS entry: {e}")
@@ -550,9 +541,9 @@ async def scrape_jobs(base_url: str, tech_park: str, existing_links: Set[str], m
         page = 1
         all_jobs = []
         semaphore = asyncio.Semaphore(max_concurrent_requests)
-        consecutive_empty_pages = 0  # Track consecutive empty pages to avoid infinite loops
+        consecutive_empty_pages = 0
 
-        while consecutive_empty_pages < 3:  # Stop after 3 consecutive empty pages
+        while consecutive_empty_pages < 3:
             url = f"{base_url}?page={page}"
             logging.info(f"Fetching {url}")
             html_or_json = await fetch(session, url)
@@ -570,7 +561,7 @@ async def scrape_jobs(base_url: str, tech_park: str, existing_links: Set[str], m
                         consecutive_empty_pages += 1
                         logging.info(f"No job rows found on page {page}, consecutive empty pages: {consecutive_empty_pages}")
                         break
-                    consecutive_empty_pages = 0  # Reset counter when we find jobs
+                    consecutive_empty_pages = 0
 
                     for row in rows:
                         try:
@@ -604,7 +595,7 @@ async def scrape_jobs(base_url: str, tech_park: str, existing_links: Set[str], m
                             consecutive_empty_pages += 1
                             logging.info(f"No job data found on page {page}, consecutive empty pages: {consecutive_empty_pages}")
                             break
-                        consecutive_empty_pages = 0  # Reset counter when we find jobs
+                        consecutive_empty_pages = 0
 
                         for job in data["data"]:
                             try:
@@ -630,7 +621,6 @@ async def scrape_jobs(base_url: str, tech_park: str, existing_links: Set[str], m
                 consecutive_empty_pages += 1
                 continue
 
-            # Optimization: Stop if all jobs on current page are duplicates (and not page 1)
             if not jobs_in_page:
                 if page > 1:
                     consecutive_empty_pages += 1
@@ -639,9 +629,8 @@ async def scrape_jobs(base_url: str, tech_park: str, existing_links: Set[str], m
                     logging.info(f"All jobs on page 1 are duplicates. No new jobs at {tech_park}.")
                     break
             else:
-                consecutive_empty_pages = 0  # Reset if we found jobs
+                consecutive_empty_pages = 0
 
-            # Process jobs on this page
             tasks = []
             for company, role, deadline, link in jobs_in_page:
                 try:
@@ -662,7 +651,6 @@ async def scrape_jobs(base_url: str, tech_park: str, existing_links: Set[str], m
                     else:
                         desc, comp_profile, email = await task
                     formatted_desc = format_description(desc)
-                    # Only add jobs with deadlines in the future
                     if is_deadline_in_future(deadline):
                         all_jobs.append((company, role, deadline, link, tech_park, formatted_desc, comp_profile, email))
                     else:
@@ -684,13 +672,10 @@ def remove_similar_jobs(jobs: List[Tuple], similarity_threshold: float = 0.9) ->
     if not jobs:
         return jobs
 
-    # Simple similarity function based on role and company
     def similarity(job1: Tuple, job2: Tuple) -> float:
-        # Compare role (index 1) and company (index 0)
         role1, company1 = job1[1].lower(), job1[0].lower()
         role2, company2 = job2[1].lower(), job2[0].lower()
 
-        # Calculate similarity - simple approach using common words
         role_words1 = set(role1.split())
         role_words2 = set(role2.split())
         common_role_words = role_words1.intersection(role_words2)
@@ -701,7 +686,6 @@ def remove_similar_jobs(jobs: List[Tuple], similarity_threshold: float = 0.9) ->
         common_company_words = company_words1.intersection(company_words2)
         company_similarity = len(common_company_words) / max(len(company_words1), len(company_words2), 1)
 
-        # Weight role similarity more heavily than company similarity
         return 0.7 * role_similarity + 0.3 * company_similarity
 
     unique_jobs = []
@@ -710,8 +694,7 @@ def remove_similar_jobs(jobs: List[Tuple], similarity_threshold: float = 0.9) ->
         for unique_job in unique_jobs:
             if similarity(job, unique_job) >= similarity_threshold:
                 is_similar = True
-                # Keep the job with more complete information (longer description)
-                if len(job[5]) > len(unique_job[5]):  # Compare description lengths
+                if len(job[5]) > len(unique_job[5]):
                     unique_jobs.remove(unique_job)
                     unique_jobs.append(job)
                 break
@@ -720,16 +703,12 @@ def remove_similar_jobs(jobs: List[Tuple], similarity_threshold: float = 0.9) ->
 
     return unique_jobs
 
-
 def save_jobs_to_db(jobs: List[Tuple]) -> None:
     """Save jobs to MySQL database using INSERT IGNORE to avoid duplicates."""
     try:
-        # Remove similar jobs to avoid duplicates across sources
         unique_jobs = remove_similar_jobs(jobs)
-
         conn = get_db_connection()
         cursor = conn.cursor()
-        # MySQL uses %s for placeholders
         query = """
             INSERT IGNORE INTO jobs
             (company, role, deadline, link, tech_park, description, company_profile, email)
@@ -766,10 +745,8 @@ async def update_missing_emails() -> None:
         semaphore = asyncio.Semaphore(10)
         tasks = []
         for job in jobs_missing_email:
-            # MySQL result is a tuple, indexes should be same as select
             job_link = job[3]
             tech_park = job[4]
-            # Skip email update for UL/RSS for now as they don't have detail scrapers set up in this specific function yet
             if tech_park not in ["Infopark", "Technopark"]:
                 continue
                 
@@ -796,28 +773,90 @@ async def update_missing_emails() -> None:
         await asyncio.gather(*tasks)
     logging.info("Finished updating missing emails.")
 
-def clean_jobs_with_gemini():
-    """Clean job descriptions using Google Gemini API in batches."""
-    if not GEMINI_API_KEY:
-        logging.warning("GEMINI_API_KEY is not set. Skipping data cleaning.")
+# --- Multi-Provider AI Cleaning Logic ---
+
+class LLMProvider:
+    """Abstract base class for LLM providers."""
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def generate_cleaned_data(self, prompt: str) -> str:
+        raise NotImplementedError
+
+class NativeGeminiClient(LLMProvider):
+    """Client for Google's native Gemini API."""
+    def __init__(self, api_key: str):
+        super().__init__(api_key)
+        self.client = genai.Client(api_key=api_key)
+
+    def generate_cleaned_data(self, prompt: str) -> str:
+        response = self.client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json"
+            )
+        )
+        return response.text
+
+class OpenRouterClient(LLMProvider):
+    """Client for OpenRouter API (OpenAI compatible)."""
+    def __init__(self, api_key: str):
+        super().__init__(api_key)
+        self.client = openai.OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key
+        )
+
+    def generate_cleaned_data(self, prompt: str) -> str:
+        response = self.client.chat.completions.create(
+            model="mistralai/mistral-small-3.1-24b-instruct:free",
+            messages=[
+                {"role": "system", "content": "You are a data extraction assistant that only outputs valid JSON. Do not include any introductory or concluding text."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"}
+        )
+        return response.choices[0].message.content
+
+class ClientRotator:
+    """Manages round-robin rotation of LLM clients."""
+    def __init__(self):
+        self.clients: List[LLMProvider] = []
+        if GEMINI_API_KEY:
+            self.clients.append(NativeGeminiClient(GEMINI_API_KEY))
+        
+        for key in OPENROUTER_API_KEYS:
+            self.clients.append(OpenRouterClient(key))
+        
+        self._index = 0
+
+    def get_next_client(self) -> Optional[LLMProvider]:
+        if not self.clients:
+            return None
+        client = self.clients[self._index]
+        self._index = (self._index + 1) % len(self.clients)
+        return client
+
+def clean_jobs_with_ai():
+    """Clean job descriptions using available AI providers in round-robin."""
+    rotator = ClientRotator()
+    if not rotator.clients:
+        logging.warning("No AI API keys configured (Gemini or OpenRouter). Skipping cleaning.")
         return
 
-    logging.info("Starting Gemini data cleaning (Batch Mode)...")
+    logging.info(f"Starting AI data cleaning with {len(rotator.clients)} providers (Batch Mode)...")
     
     BATCH_SIZE = 5
-    MAX_LOOPS = 50  # Safety limit: Process max 50 * 50 = 2500 jobs per run
+    MAX_LOOPS = 50
     loop_count = 0
     total_cleaned = 0
     
     try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        
         while loop_count < MAX_LOOPS:
             conn = get_db_connection()
             cursor = conn.cursor(dictionary=True)
             
-            # Fetch a chunk of uncleaned jobs
-            # Added check for cleaned_data IS NULL to be double safe
             cursor.execute("""
                 SELECT id, role, company, description, company_profile 
                 FROM jobs 
@@ -835,22 +874,16 @@ def clean_jobs_with_gemini():
                     logging.info("All pending jobs have been processed.")
                 break
 
-            logging.info(f"Loop {loop_count + 1}: Found {len(jobs_to_clean)} jobs to clean. Processing...")
-
-            # Connect for updates (keep connection open for the batch processing loop)
+            logging.info(f"Loop {loop_count + 1}: Found {len(jobs_to_clean)} jobs to clean.")
             conn = get_db_connection()
 
-            # Process in batches of 5 (Gemini API limit/optimization)
             for i in range(0, len(jobs_to_clean), BATCH_SIZE):
                 batch = jobs_to_clean[i : i + BATCH_SIZE]
                 batch_input = []
                 
                 for job in batch:
                     raw_text = f"Role: {job['role']}\nCompany: {job['company']}\nDescription: {job['description']}\nCompany Profile: {job['company_profile']}"
-                    batch_input.append({
-                        "id": job['id'],
-                        "text": raw_text
-                    })
+                    batch_input.append({"id": job['id'], "text": raw_text})
 
                 prompt = """
                 You are a data cleaning assistant. I will provide a list of job descriptions.
@@ -871,45 +904,35 @@ def clean_jobs_with_gemini():
                 Input Data:
                 """ + json.dumps(batch_input)
 
+                client = rotator.get_next_client()
+                provider_name = client.__class__.__name__
+
                 try:
-                    # Call Gemini API
-                    response = client.models.generate_content(
-                        model="gemini-2.5-flash",
-                        contents=prompt,
-                        config=types.GenerateContentConfig(
-                            response_mime_type="application/json"
-                        )
-                    )
-                    
-                    # Parse the batch response
-                    cleaned_batch = json.loads(response.text)
+                    # logging.info(f"  Requesting batch cleaning via {provider_name}...")
+                    response_text = client.generate_cleaned_data(prompt)
+                    cleaned_batch = json.loads(response_text)
                     
                     update_cursor = conn.cursor()
-                    
-                    # Update each job in the batch
                     for job_id_str, cleaned_data in cleaned_batch.items():
-                        # Gemini might return ID as string, convert to ensure match
                         cleaned_json_str = json.dumps(cleaned_data)
-                        
                         update_cursor.execute(
                             "UPDATE jobs SET cleaned_data = %s, is_cleaned = TRUE WHERE id = %s",
                             (cleaned_json_str, job_id_str)
                         )
                         total_cleaned += 1
-                    
                     conn.commit()
-                    logging.info(f"  Processed sub-batch of {len(cleaned_batch)} jobs. Total cleaned so far: {total_cleaned}")
-                    
-                    # Sleep briefly to respect rate limits
-                    time.sleep(2) 
+                    # logging.info(f"  Processed {len(cleaned_batch)} jobs.")
+                    time.sleep(1) # Short delay even with rotation
 
                 except Exception as e:
-                    logging.error(f"Error processing batch starting at index {i} in loop {loop_count}: {e}")
+                    logging.error(f"Error processing batch with {provider_name}: {e}")
+                    # In a real system, you might retry this specific batch with the next provider.
+                    # Here we just log and skip to keep flow simple.
             
             conn.close()
             loop_count += 1
             
-        logging.info(f"Gemini cleaning session completed. Total jobs cleaned: {total_cleaned}")
+        logging.info(f"AI cleaning session completed. Total jobs cleaned: {total_cleaned}")
 
     except Exception as e:
         logging.error(f"Fatal error in cleaning process: {e}")
@@ -1012,11 +1035,8 @@ async def main() -> None:
 
     await update_missing_emails()
 
-    # Run cleaning synchronously if Gemini API key is available
-    if GEMINI_API_KEY:
-        clean_jobs_with_gemini()
-    else:
-        logging.info("GEMINI_API_KEY not set, skipping data cleaning.")
+    # Run AI cleaning
+    clean_jobs_with_ai()
 
     # Log statistics
     stats.log_stats()

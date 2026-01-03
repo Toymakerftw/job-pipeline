@@ -27,6 +27,7 @@ services:
       - INFOPARK_URL=https://infopark.in/companies/job-search
       - TECHNOPARK_URL=https://technopark.org/api/paginated-jobs
       - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - OPENROUTER_API_KEYS=${OPENROUTER_API_KEYS}
 
 volumes:
   db_data:
