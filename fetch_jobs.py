@@ -893,6 +893,7 @@ def clean_jobs_with_ai():
                 
                 Format for each value:
                 {
+                  "job_title": "The specific job title or designation",
                   "job_summary": "A short 2-sentence summary of the role",
                   "skills": ["skill1", "skill2"],
                   "experience_required": "e.g., '2-4 years' or 'Fresher'",
