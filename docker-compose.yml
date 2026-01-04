@@ -14,17 +14,27 @@ services:
     volumes:
       - db_data:/var/lib/mysql
 
+  redis:
+    image: redis:alpine
+    container_name: kljobs_redis
+    restart: always
+    ports:
+      - "6379:6379"
+
   job-scraper:
     build: .
     container_name: job-scraper
     restart: always
     depends_on:
       - db
+      - redis
     environment:
-      - DB_HOST=db  # Connects to the 'db' service name internally
+      - DB_HOST=db
       - DB_USER=kljobs_user
       - DB_PASSWORD=PX#lGJi5D68lH@
       - DB_NAME=kljobs_db
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
       - SCRAPE_INTERVAL=43200
       - INFOPARK_URL=https://infopark.in/companies/job-search
       - TECHNOPARK_URL=https://technopark.org/api/paginated-jobs

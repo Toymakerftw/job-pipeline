@@ -7,6 +7,7 @@ import os
 import re
 import time
 import json
+import redis
 import feedparser
 from urllib.parse import urljoin
 from datetime import datetime
@@ -54,6 +55,11 @@ DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_USER = os.getenv("DB_USER", "kljobs_user")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "PX#lGJi5D68lH@")
 DB_NAME = os.getenv("DB_NAME", "kljobs_db")
+
+# Redis Configuration
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
 
 # Configure logging
 logging.basicConfig(
@@ -939,6 +945,82 @@ def clean_jobs_with_ai():
     except Exception as e:
         logging.error(f"Fatal error in cleaning process: {e}")
 
+def cache_jobs_to_redis() -> None:
+    """Fetch all valid jobs from MySQL and cache them in Redis as a JSON string."""
+    logging.info("Starting Redis caching...")
+    try:
+        # 1. Fetch jobs from MySQL
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        
+        # Select relevant fields. We can add specific filtering (e.g. deadline) here if needed.
+        query = """
+            SELECT id, company, role, deadline, link, tech_park, description, company_profile, email, cleaned_data 
+            FROM jobs 
+            ORDER BY id DESC
+        """
+        cursor.execute(query)
+        jobs = cursor.fetchall()
+        conn.close()
+        
+        if not jobs:
+            logging.warning("No jobs found in database to cache.")
+            return
+
+        # 2. Process and Format Data
+        formatted_jobs = []
+        for job in jobs:
+            job_data = {
+                "id": job["id"],
+                "company": job["company"],
+                "role": job["role"],
+                "deadline": job["deadline"],
+                "link": job["link"],
+                "tech_park": job["tech_park"],
+                "original_description": job["description"],
+                "company_profile": job["company_profile"],
+                "email": job["email"],
+                "is_cleaned": False
+            }
+            
+            # Merge with cleaned data if available
+            if job["cleaned_data"]:
+                try:
+                    cleaned = json.loads(job["cleaned_data"]) if isinstance(job["cleaned_data"], str) else job["cleaned_data"]
+                    job_data.update({
+                        "role": cleaned.get("job_title", job["role"]), # Prefer cleaned title
+                        "summary": cleaned.get("job_summary"),
+                        "skills": cleaned.get("skills", []),
+                        "experience": cleaned.get("experience_required"),
+                        "clean_description": cleaned.get("clean_description"),
+                        "clean_address": cleaned.get("clean_address"),
+                        "is_cleaned": True
+                    })
+                except Exception as e:
+                    logging.warning(f"Failed to parse cleaned_data for job {job['id']}: {e}")
+
+            formatted_jobs.append(job_data)
+
+        # 3. Store in Redis
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, decode_responses=True)
+        
+        # We store the entire list as one JSON string. 
+        # For very large datasets, we might want to paginate or use Redis Lists/Hashes, 
+        # but for a job board (thousands of jobs), a single JSON string is usually fine and fastest for the frontend to retrieve all.
+        r.set("jobs_data", json.dumps(formatted_jobs))
+        
+        # Also set a timestamp
+        r.set("last_updated", datetime.now().isoformat())
+        
+        logging.info(f"Successfully cached {len(formatted_jobs)} jobs to Redis key 'jobs_data'.")
+
+    except redis.RedisError as e:
+        logging.error(f"Redis error: {e}")
+    except mysql.connector.Error as e:
+        logging.error(f"Database error during caching: {e}")
+    except Exception as e:
+        logging.error(f"Unexpected error during Redis caching: {e}")
+
 class ScrapingStats:
     """Track statistics about the scraping process"""
     def __init__(self):
@@ -1039,6 +1121,9 @@ async def run_cycle() -> None:
 
     # Run AI cleaning
     clean_jobs_with_ai()
+
+    # Cache to Redis
+    cache_jobs_to_redis()
 
     # Log statistics
     stats.log_stats()
