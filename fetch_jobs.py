@@ -864,8 +864,9 @@ def clean_jobs_with_ai():
             conn = get_db_connection()
             cursor = conn.cursor(dictionary=True)
             
+            # Fetch extra fields (link, deadline, tech_park) to inject into the JSON
             cursor.execute("""
-                SELECT id, role, company, description, company_profile 
+                SELECT id, role, company, description, company_profile, link, deadline, tech_park
                 FROM jobs 
                 WHERE is_cleaned = FALSE AND cleaned_data IS NULL
                 LIMIT 50
@@ -888,6 +889,9 @@ def clean_jobs_with_ai():
                 batch = jobs_to_clean[i : i + BATCH_SIZE]
                 batch_input = []
                 
+                # Create a lookup map for the batch to easily retrieve metadata later
+                job_map = {str(job['id']): job for job in batch}
+
                 for job in batch:
                     raw_text = f"Role: {job['role']}\nCompany: {job['company']}\nDescription: {job['description']}\nCompany Profile: {job['company_profile']}"
                     batch_input.append({"id": job['id'], "text": raw_text})
@@ -922,6 +926,17 @@ def clean_jobs_with_ai():
                     
                     update_cursor = conn.cursor()
                     for job_id_str, cleaned_data in cleaned_batch.items():
+                        # Inject metadata into the JSON before saving
+                        original_job = job_map.get(str(job_id_str))
+                        if original_job:
+                            cleaned_data['id'] = original_job['id']
+                            cleaned_data['company'] = original_job['company']
+                            cleaned_data['link'] = original_job['link']
+                            cleaned_data['deadline'] = original_job['deadline']
+                            cleaned_data['tech_park'] = original_job['tech_park']
+                            # We can also verify/add email if the AI missed it but DB has it
+                            # (Optional, but let's stick to the core request)
+
                         cleaned_json_str = json.dumps(cleaned_data)
                         update_cursor.execute(
                             "UPDATE jobs SET cleaned_data = %s, is_cleaned = TRUE WHERE id = %s",
@@ -953,9 +968,10 @@ def cache_jobs_to_redis() -> None:
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
         
-        # Select relevant fields. We can add specific filtering (e.g. deadline) here if needed.
+        # Select relevant fields. We fetch everything to handle uncleaned jobs 
+        # and backfill missing fields in old cleaned jobs.
         query = """
-            SELECT id, company, role, deadline, link, tech_park, description, company_profile, email, cleaned_data 
+            SELECT id, company, role, deadline, link, tech_park, description, company_profile, email, cleaned_data, is_cleaned
             FROM jobs 
             ORDER BY id DESC
         """
@@ -970,34 +986,48 @@ def cache_jobs_to_redis() -> None:
         # 2. Process and Format Data
         formatted_jobs = []
         for job in jobs:
-            job_data = {
-                "id": job["id"],
-                "company": job["company"],
-                "role": job["role"],
-                "deadline": job["deadline"],
-                "link": job["link"],
-                "tech_park": job["tech_park"],
-                "original_description": job["description"],
-                "company_profile": job["company_profile"],
-                "email": job["email"],
-                "is_cleaned": False
-            }
+            job_data = None
             
-            # Merge with cleaned data if available
+            # If cleaned data is available, try to use it as the source of truth
             if job["cleaned_data"]:
                 try:
                     cleaned = json.loads(job["cleaned_data"]) if isinstance(job["cleaned_data"], str) else job["cleaned_data"]
-                    job_data.update({
-                        "role": cleaned.get("job_title", job["role"]), # Prefer cleaned title
-                        "summary": cleaned.get("job_summary"),
-                        "skills": cleaned.get("skills", []),
-                        "experience": cleaned.get("experience_required"),
-                        "clean_description": cleaned.get("clean_description"),
-                        "clean_address": cleaned.get("clean_address"),
-                        "is_cleaned": True
-                    })
+                    
+                    # Ensure critical metadata exists (for backward compatibility with old records)
+                    # If these keys are missing in the JSON, fill them from the DB columns
+                    if 'id' not in cleaned: cleaned['id'] = job['id']
+                    if 'company' not in cleaned: cleaned['company'] = job['company']
+                    if 'link' not in cleaned: cleaned['link'] = job['link']
+                    if 'deadline' not in cleaned: cleaned['deadline'] = job['deadline']
+                    if 'tech_park' not in cleaned: cleaned['tech_park'] = job['tech_park']
+                    if 'email' not in cleaned and job['email']: cleaned['email'] = job['email']
+                    
+                    # Normalize fields for frontend consistency
+                    # The frontend might expect 'role' but AI gives 'job_title'. Let's ensure 'role' exists.
+                    if 'role' not in cleaned:
+                        cleaned['role'] = cleaned.get('job_title', job['role'])
+                    
+                    # Flag as cleaned
+                    cleaned['is_cleaned'] = True
+                    
+                    job_data = cleaned
                 except Exception as e:
                     logging.warning(f"Failed to parse cleaned_data for job {job['id']}: {e}")
+            
+            # Fallback: Create job object manually if not cleaned or parsing failed
+            if not job_data:
+                job_data = {
+                    "id": job["id"],
+                    "company": job["company"],
+                    "role": job["role"],
+                    "deadline": job["deadline"],
+                    "link": job["link"],
+                    "tech_park": job["tech_park"],
+                    "original_description": job["description"],
+                    "company_profile": job["company_profile"],
+                    "email": job["email"],
+                    "is_cleaned": False
+                }
 
             formatted_jobs.append(job_data)
 
