@@ -47,6 +47,7 @@ SCRAPE_DELAY = float(os.getenv("SCRAPE_DELAY", "0.5"))  # Delay between requests
 # Job filtering configuration
 FILTER_EXPIRED_JOBS = os.getenv("FILTER_EXPIRED_JOBS", "true").lower() == "true"
 MAX_DAYS_TO_DEADLINE = int(os.getenv("MAX_DAYS_TO_DEADLINE", "0"))  # 0 means no limit
+SCRAPE_INTERVAL = int(os.getenv("SCRAPE_INTERVAL", "43200"))  # Default: 12 hours (43200 seconds)
 
 # Database Configuration
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -965,9 +966,9 @@ class ScrapingStats:
         logging.info("="*50)
 
 
-async def main() -> None:
-    """Main function to scrape and update jobs."""
-    logging.info("Script is starting...")
+async def run_cycle() -> None:
+    """Single execution cycle to scrape and update jobs."""
+    logging.info("Starting scrape cycle...")
     stats = ScrapingStats()
     init_db()
 
@@ -1041,7 +1042,20 @@ async def main() -> None:
 
     # Log statistics
     stats.log_stats()
-    logging.info("Script has completed.")
+    logging.info("Scrape cycle completed.")
+
+async def main() -> None:
+    """Main entry point that runs the scrape cycle periodically."""
+    logging.info(f"Job Pipeline Scheduler started. Interval: {SCRAPE_INTERVAL} seconds.")
+    
+    while True:
+        try:
+            await run_cycle()
+        except Exception as e:
+            logging.error(f"Unexpected error in run_cycle: {e}")
+        
+        logging.info(f"Sleeping for {SCRAPE_INTERVAL} seconds...")
+        await asyncio.sleep(SCRAPE_INTERVAL)
 
 if __name__ == "__main__":
     asyncio.run(main())

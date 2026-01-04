@@ -17,6 +17,7 @@ services:
   job-scraper:
     build: .
     container_name: job-scraper
+    restart: always
     depends_on:
       - db
     environment:
@@ -24,6 +25,7 @@ services:
       - DB_USER=kljobs_user
       - DB_PASSWORD=PX#lGJi5D68lH@
       - DB_NAME=kljobs_db
+      - SCRAPE_INTERVAL=43200
       - INFOPARK_URL=https://infopark.in/companies/job-search
       - TECHNOPARK_URL=https://technopark.org/api/paginated-jobs
       - GEMINI_API_KEY=${GEMINI_API_KEY}
