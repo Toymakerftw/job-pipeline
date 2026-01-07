@@ -40,6 +40,9 @@ services:
       - TECHNOPARK_URL=https://technopark.org/api/paginated-jobs
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - OPENROUTER_API_KEYS=${OPENROUTER_API_KEYS}
+      - SCRAPE_INTERVAL=43200
+      - PROCESS_INTERVAL=3600
+      - AI_DAILY_REQUEST_LIMIT=50
 
 volumes:
   db_data:
