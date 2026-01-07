@@ -5,7 +5,7 @@ import os
 import re
 import ssl
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import List, Optional, Set, Dict, Any, Tuple
 
@@ -27,13 +27,13 @@ load_dotenv()
 @dataclass
 class Config:
     # Database
-    DB_HOST: str = os.getenv("DB_HOST", "localhost")
+    DB_HOST: str = os.getenv("DB_HOST", "db") # Updated default to match docker-compose service name
     DB_USER: str = os.getenv("DB_USER", "kljobs_user")
     DB_PASSWORD: str = os.getenv("DB_PASSWORD", "PX#lGJi5D68lH@")
     DB_NAME: str = os.getenv("DB_NAME", "kljobs_db")
     
     # Redis
-    REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
+    REDIS_HOST: str = os.getenv("REDIS_HOST", "redis") # Updated default
     REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))
     REDIS_PASSWORD: Optional[str] = os.getenv("REDIS_PASSWORD")
 
@@ -50,8 +50,11 @@ class Config:
 
     # AI Keys & Limits
     GEMINI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY")
-    OPENROUTER_API_KEYS: List[str] = [k.strip() for k in os.getenv("OPENROUTER_API_KEYS", "").split(",") if k.strip()]
-    AI_DAILY_REQUEST_LIMIT: int = int(os.getenv("AI_DAILY_REQUEST_LIMIT", "50")) # Intelligent Limit
+    
+    # Fixed mutable default argument using field(default_factory=...)
+    OPENROUTER_API_KEYS: List[str] = field(default_factory=lambda: [k.strip() for k in os.getenv("OPENROUTER_API_KEYS", "").split(",") if k.strip()])
+    
+    AI_DAILY_REQUEST_LIMIT: int = int(os.getenv("AI_DAILY_REQUEST_LIMIT", "50"))
 
 # --- Logging Setup ---
 os.makedirs("logs", exist_ok=True)
@@ -79,18 +82,44 @@ class DBManager:
         }
         self._pool = None
 
+    def _wait_for_db(self):
+        """Retry logic to wait for DB to come online"""
+        logger.info("Waiting for database connection...")
+        retries = 20
+        while retries > 0:
+            try:
+                conn = mysql.connector.connect(
+                    host=self.db_config['host'],
+                    user=self.db_config['user'],
+                    password=self.db_config['password'],
+                    connection_timeout=5
+                )
+                conn.close()
+                logger.info("Database connection successful.")
+                return True
+            except mysql.connector.Error as e:
+                retries -= 1
+                logger.warning(f"Database not ready yet. Retries left: {retries}. Retrying in 5s...")
+                time.sleep(5)
+        
+        logger.error("Could not connect to database after multiple retries.")
+        return False
+
     def get_connection(self):
         try:
             if not self._pool:
-                # Initialize pool
                 self._pool = pooling.MySQLConnectionPool(pool_name="job_pool", pool_size=5, **self.db_config)
             return self._pool.get_connection()
         except mysql.connector.Error as e:
             logger.error(f"DB Connection Pool Error: {e}")
-            # Fallback for initial setup
+            # Fallback
             return mysql.connector.connect(**self.db_config)
 
     def init_db(self):
+        # Wait for DB
+        if not self._wait_for_db():
+            raise Exception("Failed to connect to Database")
+
         logger.info(f"Initializing Database: {self.config.DB_NAME}")
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -113,7 +142,7 @@ class DBManager:
             )
         """)
         
-        # Migration for older DBs
+        # Migration
         cursor.execute("SHOW COLUMNS FROM jobs LIKE 'cleaned_data'")
         if not cursor.fetchone():
             cursor.execute("ALTER TABLE jobs ADD COLUMN cleaned_data JSON")
@@ -134,22 +163,31 @@ class DBManager:
             logger.warning(f"Could not fetch existing links: {e}")
             return set()
 
-# --- Quota Manager (Intelligent Usage Control) ---
+# --- Quota Manager ---
 class QuotaManager:
     def __init__(self, config: Config):
         self.config = config
         self.redis_key = "kljobs:ai_daily_usage"
-        self.r = redis.Redis(
-            host=config.REDIS_HOST, 
-            port=config.REDIS_PORT, 
-            password=config.REDIS_PASSWORD, 
-            decode_responses=True
-        )
+        self.r = None # Lazy init
         self.daily_limit = config.AI_DAILY_REQUEST_LIMIT
+
+    def _get_client(self):
+        if not self.r:
+            self.r = redis.Redis(
+                host=self.config.REDIS_HOST, 
+                port=self.config.REDIS_PORT, 
+                password=self.config.REDIS_PASSWORD, 
+                decode_responses=True
+            )
+        return self.r
 
     def can_process(self) -> int:
         try:
-            current_usage = int(self.r.get(self.redis_key) or 0)
+            r = self._get_client()
+            # Ping to ensure redis is up
+            r.ping()
+            
+            current_usage = int(r.get(self.redis_key) or 0)
             remaining = self.daily_limit - current_usage
             
             if remaining <= 0:
@@ -159,20 +197,23 @@ class QuotaManager:
             logger.info(f"✅ Quota Check: {current_usage}/{self.daily_limit} used. {remaining} remaining.")
             return remaining
         except Exception as e:
-            logger.error(f"Failed to check quota: {e}. Proceeding with safe limit (5).")
-            return 5
+            logger.error(f"Failed to check quota (Redis might be down): {e}. Proceeding with safe limit (0).")
+            return 0
 
     def record_usage(self, count: int):
         try:
-            pipe = self.r.pipeline()
+            r = self._get_client()
+            pipe = r.pipeline()
             pipe.incrby(self.redis_key, count)
-            pipe.expire(self.redis_key, 86400) # 24 hours
+            pipe.expire(self.redis_key, 86400)
             pipe.execute()
         except Exception as e:
             logger.error(f"Failed to record usage: {e}")
 
     def reset_quota(self):
-        self.r.delete(self.redis_key)
+        try:
+            self._get_client().delete(self.redis_key)
+        except: pass
 
 # --- AI Clients ---
 class LLMProvider:
@@ -200,7 +241,7 @@ class OpenRouterClient(LLMProvider):
         )
         return res.choices[0].message.content
 
-# --- AI Cleaner (Intelligent) ---
+# --- AI Cleaner ---
 class AICleaner:
     def __init__(self, config: Config, db: DBManager):
         self.config = config
@@ -231,7 +272,6 @@ class AICleaner:
         conn = self.db.get_connection()
         cursor = conn.cursor(dictionary=True)
         
-        # Intelligent Fetch: Newest First (DESC), limited by budget
         limit = min(remaining, 50)
         cursor.execute(f"""
             SELECT id, role, company, description, company_profile, link, deadline, tech_park
@@ -266,8 +306,7 @@ class AICleaner:
                 try:
                     response_text = client.generate_cleaned_data(prompt)
                     
-                    # Check for soft quota errors in response body
-                    if "quota" in response_text.lower() or "limit" in response_text.lower() and "error" in response_text.lower():
+                    if "quota" in response_text.lower() or ("limit" in response_text.lower() and "error" in response_text.lower()):
                         raise Exception("Soft quota limit detected in response body")
 
                     cleaned_batch = json.loads(response_text)
@@ -335,6 +374,7 @@ class AICleaner:
             r = redis.Redis(host=self.config.REDIS_HOST, port=self.config.REDIS_PORT, password=self.config.REDIS_PASSWORD, decode_responses=True)
             r.set("jobs_data", json.dumps(formatted))
             r.set("last_updated", datetime.now().isoformat())
+            logger.info("Redis Cache updated.")
         except Exception as e:
             logger.error(f"Redis update failed: {e}")
 
@@ -378,19 +418,14 @@ class JobScraper:
             logger.error(f"DB Save Error: {e}")
 
     def remove_similar_jobs(self, jobs):
-        # Basic deduplication logic based on title/company
         unique = []
         seen = set()
         for job in jobs:
-            # signature = (job[0].lower(), job[1].lower()) # Company, Role
-            # Using Link is better but we already did that. 
-            # This is for cross-source duplicates where link differs.
             signature = f"{job[1]}-{job[0]}".lower() # Role - Company
             if signature not in seen:
                 seen.add(signature)
                 unique.append(job)
             else:
-                # Keep the one with longer description (likely better data)
                 for i, u_job in enumerate(unique):
                     if f"{u_job[1]}-{u_job[0]}".lower() == signature:
                         if len(job[5]) > len(u_job[5]):
@@ -413,7 +448,7 @@ class JobScraper:
         async with aiohttp.ClientSession() as session:
             page = 1
             jobs = []
-            while page < 5: # Limit pages for performance
+            while page < 5: 
                 url = f"{self.config.INFOPARK_URL}?page={page}"
                 html = await self.fetch(session, url)
                 if not html: break
@@ -447,7 +482,6 @@ class JobScraper:
         desc_div = soup.find("div", class_="deatil-box")
         desc = desc_div.get_text(strip=True) if desc_div else ""
         
-        # Simplified profile extraction
         profile = ""
         try:
             company_id = link.split('/')[-1]
@@ -499,7 +533,6 @@ class JobScraper:
         desc_div = soup.find("div", class_="mb-4")
         desc = desc_div.get_text(strip=True) if desc_div else ""
         
-        # Profile/Email
         comp_div = soup.find("div", class_="w-full")
         comp_name = comp_div.find("a").get_text(strip=True) if comp_div and comp_div.find("a") else "N/A"
         profile = f"Company: {comp_name}"
@@ -521,7 +554,7 @@ class JobScraper:
             table = soup.find("table", class_="table")
             if not table: return []
             
-            for row in table.find_all("tr")[1:]: # Skip header
+            for row in table.find_all("tr")[1:]: 
                 tds = row.find_all("td")
                 if len(tds) < 3: continue
                 link = tds[2].find("a").get("href") if tds[2].find("a") else None
@@ -532,7 +565,6 @@ class JobScraper:
                 role = tds[0].find("a").get_text(strip=True) if tds[0].find("a") else "N/A"
                 company = tds[1].find("a").get_text(strip=True) if tds[1].find("a") else "N/A"
                 
-                # Extract deadline from text
                 text = tds[0].get_text(strip=True)
                 match = re.search(r'(\d{2}-\d{2}-\d{4})', text)
                 deadline = match.group(1) if match else "N/A"
@@ -559,7 +591,6 @@ class JobScraper:
                 
                 deadline = entry.published if hasattr(entry, 'published') else "N/A"
                 desc = entry.summary if hasattr(entry, 'summary') else ""
-                # Clean HTML
                 clean_desc = BeautifulSoup(desc, "html.parser").get_text(strip=True)
                 jobs.append((company, role, deadline, link, "Cyberpark Kozhikode", clean_desc, f"Company: {company}", ""))
         except Exception as e:
@@ -588,9 +619,6 @@ async def main():
         except Exception as e:
             logger.error(f"Main Loop Error: {e}")
 
-        # Sleep for the shorter interval (Processing interval).
-        # If quota is full, process_jobs returns immediately, so we wait for the next scrape cycle effectively.
-        # But we keep checking every hour to see if quota reset or new jobs appeared.
         logger.info(f"Cycle complete. Sleeping for {cfg.PROCESS_INTERVAL}s...")
         await asyncio.sleep(cfg.PROCESS_INTERVAL)
 
