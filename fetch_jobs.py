@@ -47,11 +47,12 @@ class Config:
     # AI Keys & Limits
     GEMINI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY")
     
+    # Fixed mutable default argument using field(default_factory=...)
     OPENROUTER_API_KEYS: List[str] = field(default_factory=lambda: [k.strip() for k in os.getenv("OPENROUTER_API_KEYS", "").split(",") if k.strip()])
     
-    AI_DAILY_REQUEST_LIMIT: int = int(os.getenv("AI_DAILY_REQUEST_LIMIT", "50"))
-    OR_RPM_LIMIT: int = 20
-    OR_DAILY_LIMIT: int = 50
+    # Per-Key Limits (Default: OpenRouter Free Tier)
+    OR_KEY_RPM_LIMIT: int = int(os.getenv("OR_KEY_RPM_LIMIT", "20"))
+    OR_KEY_DAILY_LIMIT: int = int(os.getenv("OR_KEY_DAILY_LIMIT", "50"))
 
 # --- Logging Setup ---
 os.makedirs("logs", exist_ok=True)
@@ -212,7 +213,7 @@ class KeyTracker:
             return False
             
         # Check Daily Limit
-        if self.daily_usage >= self.config.OR_DAILY_LIMIT:
+        if self.daily_usage >= self.config.OR_KEY_DAILY_LIMIT:
             return False
 
         # Check RPM (Sliding window)
@@ -220,7 +221,7 @@ class KeyTracker:
         while self.timestamps and now - self.timestamps[0] > 60:
             self.timestamps.popleft()
             
-        if len(self.timestamps) >= self.config.OR_RPM_LIMIT:
+        if len(self.timestamps) >= self.config.OR_KEY_RPM_LIMIT:
             return False
             
         return True
