@@ -177,7 +177,7 @@ class NativeGeminiClient(LLMProvider):
 
 class OpenRouterClient(LLMProvider):
     def __init__(self, key):
-        self.client = openai.OpenAI(base_url="https://openrouter.ai/api/v1", api_key=key)
+        self.client = openai.OpenAI(base_url="https://openrouter.ai/api/v1", api_key=key, max_retries=0)
     def generate_cleaned_data(self, prompt: str) -> str:
         res = self.client.chat.completions.create(
             model="mistralai/mistral-small-3.1-24b-instruct:free",
