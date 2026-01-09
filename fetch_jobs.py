@@ -569,18 +569,44 @@ class JobScraper:
         html = await self.fetch(session, link)
         if not html: return "", "", ""
         soup = BeautifulSoup(html, "html.parser")
-        desc_div = soup.find("div", class_="mb-4")
-        desc = desc_div.get_text(strip=True) if desc_div else ""
         
+        # --- Description Strategies ---
+        description = "N/A"
+        
+        # Strategy 1: The "Gold Standard" Class
+        target_div = soup.select_one(".jd-description-text")
+        if target_div:
+            description = target_div.get_text(strip=True, separator="\n")
+            
+        # Strategy 2: The TinyMCE Container
+        if description == "N/A" or len(description) < 50:
+            target_div = soup.select_one("div._mce-content-body_silut_1")
+            if target_div:
+                description = target_div.get_text(strip=True, separator="\n")
+
+        # Strategy 3: Header Search (Fallback)
+        if description == "N/A" or len(description) < 50:
+            header = soup.find("h3", string=lambda t: t and "Brief Description" in t)
+            if header:
+                parent_wrapper = header.find_parent("div")
+                if parent_wrapper:
+                    description = parent_wrapper.get_text(strip=True, separator="\n")
+                    description = description.replace("Brief Description", "").strip()
+
+        if description == "N/A":
+             description = ""
+
+        # Profile
         comp_div = soup.find("div", class_="w-full")
         comp_name = comp_div.find("a").get_text(strip=True) if comp_div and comp_div.find("a") else "N/A"
         profile = f"Company: {comp_name}"
         
+        # Email
         email = ""
         a_tag = soup.find("a", href=lambda x: x and "mailto:" in x)
         if a_tag: email = a_tag.get_text(strip=True).replace("mailto:", "")
         
-        return desc, profile, email
+        return description, profile, email
 
     async def scrape_ul(self):
         logger.info("Scraping UL Cyberpark...")
