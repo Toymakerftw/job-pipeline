@@ -41,7 +41,7 @@ class Config:
     
     # Timing
     SCRAPE_INTERVAL: int = int(os.getenv("SCRAPE_INTERVAL", "43200"))  # 12 hours
-    PROCESS_INTERVAL: int = int(os.getenv("PROCESS_INTERVAL", "3600"))  # 1 hour
+    PROCESS_INTERVAL: int = int(os.getenv("PROCESS_INTERVAL", "300"))  # 5 minutes
     REQUEST_TIMEOUT: int = 30
 
     # AI Keys & Limits
@@ -207,13 +207,17 @@ class KeyTracker:
             logger.error(f"Redis get error: {e}")
             return 9999 # Fail safe to avoid usage if redis down
 
+    @property
+    def has_daily_capacity(self) -> bool:
+        return self.daily_usage < self.config.OR_KEY_DAILY_LIMIT
+
     def is_available(self) -> bool:
         # Check Cooldown
         if time.time() < self.cooldown_until:
             return False
             
         # Check Daily Limit
-        if self.daily_usage >= self.config.OR_KEY_DAILY_LIMIT:
+        if not self.has_daily_capacity:
             return False
 
         # Check RPM (Sliding window)
@@ -253,6 +257,9 @@ class KeyManager:
                 return tracker, self.clients[tracker.key]
         return None
 
+    def has_any_daily_capacity(self) -> bool:
+        return any(t.has_daily_capacity for t in self.trackers)
+
 # --- AI Cleaner ---
 class AICleaner:
     def __init__(self, config: Config, db: DBManager):
@@ -269,109 +276,107 @@ class AICleaner:
         self.gemini_client = NativeGeminiClient(config.GEMINI_API_KEY) if config.GEMINI_API_KEY else None
 
     def process_jobs(self):
-        logger.info("Starting AI Cleaning...")
-        conn = self.db.get_connection()
-        cursor = conn.cursor(dictionary=True)
+        logger.info("Starting AI Cleaning Cycle...")
         
-        # We fetch a batch, but processing will stop if keys are exhausted
-        cursor.execute(f"""
-            SELECT id, role, company, description, company_profile, link, deadline, tech_park
-            FROM jobs 
-            WHERE is_cleaned = FALSE AND cleaned_data IS NULL 
-            ORDER BY id DESC 
-            LIMIT 50
-        """)
-        jobs = cursor.fetchall()
-        cursor.close()
-        
-        if not jobs:
-            conn.close()
-            return
+        while True:
+            # 1. Check if we have ANY capacity (Daily) or Gemini
+            # If all OpenRouter keys are daily-exhausted AND no Gemini key, we stop.
+            if not self.key_manager.has_any_daily_capacity() and not self.gemini_client:
+                logger.warning("All AI keys exhausted (Daily Limit). Stopping cycle.")
+                break
 
-        BATCH_SIZE = 1 # Reducing batch size to 1 for better granular control with key rotation, or keep 5?
-        # Requirement said "process_jobs loop", let's keep it simple.
-        # But wait, original code did batches of 5.
-        # If we use batching, we need to ensure the key can handle the batch? 
-        # API calls in original were 1 call per batch of 5 jobs.
-        # So 1 API call = 1 request usage. That's fine.
-        BATCH_SIZE = 5 
-        total_cleaned = 0
-        
-        try:
-            for i in range(0, len(jobs), BATCH_SIZE):
-                batch = jobs[i:i + BATCH_SIZE]
-                job_map = {str(j['id']): j for j in batch}
-                
-                batch_input = [{"id": j['id'], "text": f"Role: {j['role']}\nCompany: {j['company']}\nDesc: {j['description']}"} for j in batch]
-                prompt = f"""
-                Extract data into JSON. Keys are input IDs. 
-                Value format: {{"job_title", "job_summary", "skills": [], "experience_required", "clean_description", "clean_address", "clean_email"}}
-                Input: {json.dumps(batch_input)}
-                """
-                
-                # Logic to get client
-                tracker = None
-                client = None
-                
-                # Try OpenRouter KeyManager first
-                or_result = self.key_manager.get_best_client()
-                if or_result:
-                    tracker, client = or_result
-                elif self.gemini_client:
-                    client = self.gemini_client
-                    # No tracker for Gemini
-                
-                if not client:
-                    logger.warning("No available AI clients (Quota exceeded or Cooldown). Stopping.")
-                    break
-
-                try:
-                    response_text = client.generate_cleaned_data(prompt)
-                    
-                    if "quota" in response_text.lower() or ("limit" in response_text.lower() and "error" in response_text.lower()):
-                        raise RateLimitError("Soft quota limit detected in response body", response=None, body=None)
-
-                    # Success! Increment usage if tracker exists
-                    if tracker:
-                        tracker.increment_usage()
-
-                    cleaned_batch = json.loads(response_text)
-                    update_cursor = conn.cursor()
-                    for jid, data in cleaned_batch.items():
-                        original = job_map.get(str(jid))
-                        if original:
-                            data['id'] = original['id']
-                            data['company'] = original['company']
-                            data['link'] = original['link']
-                            data['deadline'] = original['deadline']
-                            data['tech_park'] = original['tech_park']
-                            data['role'] = data.get('job_title', original['role'])
-                        
-                        update_cursor.execute(
-                            "UPDATE jobs SET cleaned_data = %s, is_cleaned = TRUE WHERE id = %s",
-                            (json.dumps(data), jid)
-                        )
-                        total_cleaned += 1
-                    conn.commit()
-                    time.sleep(1) 
-                    
-                except RateLimitError as e:
-                    logger.warning(f"Rate Limit Hit: {e}")
-                    if tracker:
-                        tracker.trigger_cooldown()
-                    # Retry logic isn't strictly requested, but we should continue to next iteration 
-                    # which will ask KeyManager for a NEW key.
-                    continue
-                except Exception as e:
-                    logger.error(f"Batch Error: {e}")
-                    # Non-rate-limit error. 
-                    
-            if total_cleaned > 0:
-                logger.info(f"Cleaned {total_cleaned} jobs.")
+            conn = self.db.get_connection()
+            cursor = conn.cursor(dictionary=True)
             
-            self.cache_to_redis()
-        finally:
-            conn.close()
+            # Fetch small batch
+            cursor.execute("""
+                SELECT id, role, company, description, company_profile, link, deadline, tech_park
+                FROM jobs 
+                WHERE is_cleaned = FALSE AND cleaned_data IS NULL 
+                ORDER BY id DESC 
+                LIMIT 5
+            """)
+            batch = cursor.fetchall()
+            cursor.close()
+            conn.close() # Close immediately to free connection while processing AI
+
+            if not batch:
+                logger.info("No more uncleaned jobs found.")
+                break
+
+            job_map = {str(j['id']): j for j in batch}
+            batch_input = [{"id": j['id'], "text": f"Role: {j['role']}\nCompany: {j['company']}\nDesc: {j['description']}"} for j in batch]
+            prompt = f"""
+            Extract data into JSON. Keys are input IDs. 
+            Value format: {{"job_title", "job_summary", "skills": [], "experience_required", "clean_description", "clean_address", "clean_email"}}
+            Input: {json.dumps(batch_input)}
+            """
+
+            # 2. Get Client
+            tracker = None
+            client = None
+            
+            or_result = self.key_manager.get_best_client()
+            if or_result:
+                tracker, client = or_result
+            elif self.gemini_client:
+                client = self.gemini_client
+            
+            if not client:
+                # If we are here, it means has_any_daily_capacity() was true (or Gemini exists),
+                # BUT get_best_client() failed. This implies RPM Limit / Cooldown.
+                logger.info("Keys momentarily unavailable (RPM/Cooldown). Sleeping 10s...")
+                time.sleep(10)
+                continue
+
+            # 3. Execute
+            try:
+                conn = self.db.get_connection() # Reconnect for update
+                response_text = client.generate_cleaned_data(prompt)
+                
+                if "quota" in response_text.lower() or ("limit" in response_text.lower() and "error" in response_text.lower()):
+                    raise RateLimitError("Soft quota limit detected in response body", response=None, body=None)
+
+                if tracker: tracker.increment_usage()
+
+                cleaned_batch = json.loads(response_text)
+                update_cursor = conn.cursor()
+                count = 0
+                for jid, data in cleaned_batch.items():
+                    original = job_map.get(str(jid))
+                    if original:
+                        data['id'] = original['id']
+                        data['company'] = original['company']
+                        data['link'] = original['link']
+                        data['deadline'] = original['deadline']
+                        data['tech_park'] = original['tech_park']
+                        data['role'] = data.get('job_title', original['role'])
+                    
+                    update_cursor.execute(
+                        "UPDATE jobs SET cleaned_data = %s, is_cleaned = TRUE WHERE id = %s",
+                        (json.dumps(data), jid)
+                    )
+                    count += 1
+                conn.commit()
+                logger.info(f"Cleaned batch of {count} jobs.")
+                conn.close()
+                
+                # Small courtesy sleep to not hammer DB/CPU, but very short
+                time.sleep(1)
+
+            except RateLimitError as e:
+                if conn: conn.close()
+                logger.warning(f"Rate Limit Hit: {e}")
+                if tracker: tracker.trigger_cooldown()
+                continue # Loop again to try next key immediately
+            except Exception as e:
+                if conn: conn.close()
+                logger.error(f"Batch Error: {e}")
+                # If it's not a rate limit, maybe skip this batch or sleep? 
+                # Let's sleep briefly to avoid error loops
+                time.sleep(5)
+        
+        self.cache_to_redis()
 
     def cache_to_redis(self):
         try:
