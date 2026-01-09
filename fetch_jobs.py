@@ -1,10 +1,5 @@
-import asyncio
-import json
-import logging
-import os
-import re
-import ssl
-import time
+import hashlib
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import List, Optional, Set, Dict, Any, Tuple
@@ -18,6 +13,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 import openai
+from openai import RateLimitError, APIConnectionError
 import redis
 
 # Load environment variables
@@ -27,13 +23,13 @@ load_dotenv()
 @dataclass
 class Config:
     # Database
-    DB_HOST: str = os.getenv("DB_HOST", "db") # Updated default to match docker-compose service name
+    DB_HOST: str = os.getenv("DB_HOST", "db")
     DB_USER: str = os.getenv("DB_USER", "kljobs_user")
     DB_PASSWORD: str = os.getenv("DB_PASSWORD", "PX#lGJi5D68lH@")
     DB_NAME: str = os.getenv("DB_NAME", "kljobs_db")
     
     # Redis
-    REDIS_HOST: str = os.getenv("REDIS_HOST", "redis") # Updated default
+    REDIS_HOST: str = os.getenv("REDIS_HOST", "redis")
     REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))
     REDIS_PASSWORD: Optional[str] = os.getenv("REDIS_PASSWORD")
 
@@ -51,10 +47,11 @@ class Config:
     # AI Keys & Limits
     GEMINI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY")
     
-    # Fixed mutable default argument using field(default_factory=...)
     OPENROUTER_API_KEYS: List[str] = field(default_factory=lambda: [k.strip() for k in os.getenv("OPENROUTER_API_KEYS", "").split(",") if k.strip()])
     
     AI_DAILY_REQUEST_LIMIT: int = int(os.getenv("AI_DAILY_REQUEST_LIMIT", "50"))
+    OR_RPM_LIMIT: int = 20
+    OR_DAILY_LIMIT: int = 50
 
 # --- Logging Setup ---
 os.makedirs("logs", exist_ok=True)
@@ -163,58 +160,6 @@ class DBManager:
             logger.warning(f"Could not fetch existing links: {e}")
             return set()
 
-# --- Quota Manager ---
-class QuotaManager:
-    def __init__(self, config: Config):
-        self.config = config
-        self.redis_key = "kljobs:ai_daily_usage"
-        self.r = None # Lazy init
-        self.daily_limit = config.AI_DAILY_REQUEST_LIMIT
-
-    def _get_client(self):
-        if not self.r:
-            self.r = redis.Redis(
-                host=self.config.REDIS_HOST, 
-                port=self.config.REDIS_PORT, 
-                password=self.config.REDIS_PASSWORD, 
-                decode_responses=True
-            )
-        return self.r
-
-    def can_process(self) -> int:
-        try:
-            r = self._get_client()
-            # Ping to ensure redis is up
-            r.ping()
-            
-            current_usage = int(r.get(self.redis_key) or 0)
-            remaining = self.daily_limit - current_usage
-            
-            if remaining <= 0:
-                logger.warning(f"⛔ Daily AI Quota Exceeded ({current_usage}/{self.daily_limit}). Pausing AI.")
-                return 0
-            
-            logger.info(f"✅ Quota Check: {current_usage}/{self.daily_limit} used. {remaining} remaining.")
-            return remaining
-        except Exception as e:
-            logger.error(f"Failed to check quota (Redis might be down): {e}. Proceeding with safe limit (0).")
-            return 0
-
-    def record_usage(self, count: int):
-        try:
-            r = self._get_client()
-            pipe = r.pipeline()
-            pipe.incrby(self.redis_key, count)
-            pipe.expire(self.redis_key, 86400)
-            pipe.execute()
-        except Exception as e:
-            logger.error(f"Failed to record usage: {e}")
-
-    def reset_quota(self):
-        try:
-            self._get_client().delete(self.redis_key)
-        except: pass
-
 # --- AI Clients ---
 class LLMProvider:
     def generate_cleaned_data(self, prompt: str) -> str: raise NotImplementedError
@@ -241,44 +186,99 @@ class OpenRouterClient(LLMProvider):
         )
         return res.choices[0].message.content
 
+# --- Key Management ---
+class KeyTracker:
+    def __init__(self, key: str, redis_client: redis.Redis, config: Config):
+        self.key = key
+        self.r = redis_client
+        self.config = config
+        self.key_hash = hashlib.md5(key.encode()).hexdigest()
+        self.usage_key = f"usage:{self.key_hash}"
+        self.timestamps = deque()
+        self.cooldown_until = 0
+
+    @property
+    def daily_usage(self) -> int:
+        try:
+            val = self.r.get(self.usage_key)
+            return int(val) if val else 0
+        except Exception as e:
+            logger.error(f"Redis get error: {e}")
+            return 9999 # Fail safe to avoid usage if redis down
+
+    def is_available(self) -> bool:
+        # Check Cooldown
+        if time.time() < self.cooldown_until:
+            return False
+            
+        # Check Daily Limit
+        if self.daily_usage >= self.config.OR_DAILY_LIMIT:
+            return False
+
+        # Check RPM (Sliding window)
+        now = time.time()
+        while self.timestamps and now - self.timestamps[0] > 60:
+            self.timestamps.popleft()
+            
+        if len(self.timestamps) >= self.config.OR_RPM_LIMIT:
+            return False
+            
+        return True
+
+    def increment_usage(self):
+        # RPM
+        self.timestamps.append(time.time())
+        # Daily
+        try:
+            pipe = self.r.pipeline()
+            pipe.incr(self.usage_key)
+            pipe.expire(self.usage_key, 86400) # 24h
+            pipe.execute()
+        except Exception as e:
+            logger.error(f"Redis error incrementing usage: {e}")
+
+    def trigger_cooldown(self, seconds=60):
+        self.cooldown_until = time.time() + seconds
+        logger.warning(f"Key {self.key_hash[:6]}... on cooldown for {seconds}s")
+
+class KeyManager:
+    def __init__(self, config: Config, redis_client: redis.Redis):
+        self.trackers = [KeyTracker(k, redis_client, config) for k in config.OPENROUTER_API_KEYS]
+        self.clients = {t.key: OpenRouterClient(t.key) for t in self.trackers}
+
+    def get_best_client(self) -> Optional[Tuple[KeyTracker, OpenRouterClient]]:
+        for tracker in self.trackers:
+            if tracker.is_available():
+                return tracker, self.clients[tracker.key]
+        return None
+
 # --- AI Cleaner ---
 class AICleaner:
     def __init__(self, config: Config, db: DBManager):
         self.config = config
         self.db = db
-        self.clients = []
-        self._index = 0
-        self.quota = QuotaManager(config)
-        self._init_clients()
-
-    def _init_clients(self):
-        if self.config.GEMINI_API_KEY:
-            self.clients.append(NativeGeminiClient(self.config.GEMINI_API_KEY))
-        for key in self.config.OPENROUTER_API_KEYS:
-            self.clients.append(OpenRouterClient(key))
-
-    def get_next_client(self):
-        if not self.clients: return None
-        client = self.clients[self._index]
-        self._index = (self._index + 1) % len(self.clients)
-        return client
+        # Redis connection for KeyManager
+        self.redis = redis.Redis(
+            host=config.REDIS_HOST, 
+            port=config.REDIS_PORT, 
+            password=config.REDIS_PASSWORD, 
+            decode_responses=True
+        )
+        self.key_manager = KeyManager(config, self.redis)
+        self.gemini_client = NativeGeminiClient(config.GEMINI_API_KEY) if config.GEMINI_API_KEY else None
 
     def process_jobs(self):
-        remaining = self.quota.can_process()
-        if remaining <= 0 or not self.clients:
-            return
-
-        logger.info(f"Starting AI Cleaning (Budget: {remaining})...")
+        logger.info("Starting AI Cleaning...")
         conn = self.db.get_connection()
         cursor = conn.cursor(dictionary=True)
         
-        limit = min(remaining, 50)
+        # We fetch a batch, but processing will stop if keys are exhausted
         cursor.execute(f"""
             SELECT id, role, company, description, company_profile, link, deadline, tech_park
             FROM jobs 
             WHERE is_cleaned = FALSE AND cleaned_data IS NULL 
             ORDER BY id DESC 
-            LIMIT {limit}
+            LIMIT 50
         """)
         jobs = cursor.fetchall()
         cursor.close()
@@ -287,7 +287,13 @@ class AICleaner:
             conn.close()
             return
 
-        BATCH_SIZE = 5
+        BATCH_SIZE = 1 # Reducing batch size to 1 for better granular control with key rotation, or keep 5?
+        # Requirement said "process_jobs loop", let's keep it simple.
+        # But wait, original code did batches of 5.
+        # If we use batching, we need to ensure the key can handle the batch? 
+        # API calls in original were 1 call per batch of 5 jobs.
+        # So 1 API call = 1 request usage. That's fine.
+        BATCH_SIZE = 5 
         total_cleaned = 0
         
         try:
@@ -302,12 +308,31 @@ class AICleaner:
                 Input: {json.dumps(batch_input)}
                 """
                 
-                client = self.get_next_client()
+                # Logic to get client
+                tracker = None
+                client = None
+                
+                # Try OpenRouter KeyManager first
+                or_result = self.key_manager.get_best_client()
+                if or_result:
+                    tracker, client = or_result
+                elif self.gemini_client:
+                    client = self.gemini_client
+                    # No tracker for Gemini
+                
+                if not client:
+                    logger.warning("No available AI clients (Quota exceeded or Cooldown). Stopping.")
+                    break
+
                 try:
                     response_text = client.generate_cleaned_data(prompt)
                     
                     if "quota" in response_text.lower() or ("limit" in response_text.lower() and "error" in response_text.lower()):
-                        raise Exception("Soft quota limit detected in response body")
+                        raise RateLimitError("Soft quota limit detected in response body", response=None, body=None)
+
+                    # Success! Increment usage if tracker exists
+                    if tracker:
+                        tracker.increment_usage()
 
                     cleaned_batch = json.loads(response_text)
                     update_cursor = conn.cursor()
@@ -329,17 +354,18 @@ class AICleaner:
                     conn.commit()
                     time.sleep(1) 
                     
+                except RateLimitError as e:
+                    logger.warning(f"Rate Limit Hit: {e}")
+                    if tracker:
+                        tracker.trigger_cooldown()
+                    # Retry logic isn't strictly requested, but we should continue to next iteration 
+                    # which will ask KeyManager for a NEW key.
+                    continue
                 except Exception as e:
-                    error_str = str(e).lower()
-                    is_quota_error = any(x in error_str for x in ["429", "quota", "limit", "credit", "402"])
-                    if is_quota_error:
-                        logger.error(f"🛑 QUOTA HIT. Stopping AI. Error: {e}")
-                        break
-                    else:
-                        logger.error(f"Batch Error: {e}")
-
+                    logger.error(f"Batch Error: {e}")
+                    # Non-rate-limit error. 
+                    
             if total_cleaned > 0:
-                self.quota.record_usage(total_cleaned)
                 logger.info(f"Cleaned {total_cleaned} jobs.")
             
             self.cache_to_redis()
@@ -371,9 +397,9 @@ class AICleaner:
                     "is_cleaned": False
                 })
 
-            r = redis.Redis(host=self.config.REDIS_HOST, port=self.config.REDIS_PORT, password=self.config.REDIS_PASSWORD, decode_responses=True)
-            r.set("jobs_data", json.dumps(formatted))
-            r.set("last_updated", datetime.now().isoformat())
+            # Use self.redis since we have it
+            self.redis.set("jobs_data", json.dumps(formatted))
+            self.redis.set("last_updated", datetime.now().isoformat())
             logger.info("Redis Cache updated.")
         except Exception as e:
             logger.error(f"Redis update failed: {e}")
