@@ -379,10 +379,8 @@ class AICleaner:
                 response_text = client.generate_cleaned_data(prompt)
                 
                 # Check for hard quota errors in response body (some providers return 200 with error JSON)
-                if any(x in response_text.lower() for x in ["credit", "quota", "insufficient", "balance"]):
-                    if tracker: tracker.jail()
-                    raise RateLimitError("Hard quota limit detected in response", response=None, body=None)
-
+                # Removed aggressive check for keywords like "balance" to avoid false positives (e.g. "work-life balance")
+                
                 if tracker: tracker.increment_usage()
 
                 cleaned_batch = json.loads(response_text)
