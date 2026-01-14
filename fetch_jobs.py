@@ -6,9 +6,8 @@ import os
 import re
 import ssl
 import time
-from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List, Optional, Set, Dict, Any, Tuple
 
 import aiohttp
@@ -20,7 +19,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 import openai
-from openai import RateLimitError, APIConnectionError
+from openai import RateLimitError
 import redis
 
 # Load environment variables
@@ -177,7 +176,7 @@ class NativeGeminiClient(LLMProvider):
         self.client = genai.Client(api_key=key)
     def generate_cleaned_data(self, prompt: str) -> str:
         res = self.client.models.generate_content(
-            model="gemini-2.5-flash", contents=prompt,
+            model="gemini-2.0-flash", contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
         return res.text
@@ -188,7 +187,7 @@ class OpenRouterClient(LLMProvider):
     def generate_cleaned_data(self, prompt: str) -> str:
         res = self.client.chat.completions.create(
             model="mistralai/mistral-small-3.1-24b-instruct:free",
-            messages=[{"role": "system", "content": "Output valid JSON only."},
+            messages=[{"role": "system", "content": "Output valid JSON only."}, 
                       {"role": "user", "content": prompt}],
             response_format={"type": "json_object"}
         )
@@ -202,7 +201,8 @@ class KeyTracker:
         self.config = config
         self.key_hash = hashlib.md5(key.encode()).hexdigest()
         self.usage_key = f"usage:{self.key_hash}"
-        self.timestamps = deque()
+        self.rpm_key = f"rpm:{self.key_hash}"
+        self.jail_key = f"jail:{self.key_hash}"
         self.cooldown_until = 0
 
     @property
@@ -218,8 +218,19 @@ class KeyTracker:
     def has_daily_capacity(self) -> bool:
         return self.daily_usage < self.config.OR_KEY_DAILY_LIMIT
 
+    def is_jailed(self) -> bool:
+        try:
+            return bool(self.r.exists(self.jail_key))
+        except Exception as e:
+            logger.error(f"Redis jail check error: {e}")
+            return False
+
     def is_available(self) -> bool:
-        # Check Cooldown
+        # Check Jail
+        if self.is_jailed():
+            return False
+
+        # Check Local Cooldown
         if time.time() < self.cooldown_until:
             return False
             
@@ -227,22 +238,30 @@ class KeyTracker:
         if not self.has_daily_capacity:
             return False
 
-        # Check RPM (Sliding window)
-        now = time.time()
-        while self.timestamps and now - self.timestamps[0] > 60:
-            self.timestamps.popleft()
+        # Check RPM (Sliding window using Redis Sorted Set)
+        try:
+            now = time.time()
+            pipe = self.r.pipeline()
+            pipe.zremrangebyscore(self.rpm_key, 0, now - 60)
+            pipe.zcard(self.rpm_key)
+            results = pipe.execute()
             
-        if len(self.timestamps) >= self.config.OR_KEY_RPM_LIMIT:
+            if results[1] >= self.config.OR_KEY_RPM_LIMIT:
+                return False
+        except Exception as e:
+            logger.error(f"Redis RPM check error: {e}")
             return False
             
         return True
 
     def increment_usage(self):
-        # RPM
-        self.timestamps.append(time.time())
-        # Daily
+        now = time.time()
         try:
             pipe = self.r.pipeline()
+            # RPM tracking
+            pipe.zadd(self.rpm_key, {str(now): now})
+            pipe.expire(self.rpm_key, 120)
+            # Daily usage
             pipe.incr(self.usage_key)
             pipe.expire(self.usage_key, 86400) # 24h
             pipe.execute()
@@ -251,7 +270,15 @@ class KeyTracker:
 
     def trigger_cooldown(self, seconds=60):
         self.cooldown_until = time.time() + seconds
-        logger.warning(f"Key {self.key_hash[:6]}... on cooldown for {seconds}s")
+        logger.warning(f"Key {self.key_hash[:6]}... on local cooldown for {seconds}s")
+
+    def jail(self):
+        """Ban key for 24 hours on hard quota errors"""
+        try:
+            self.r.set(self.jail_key, "1", ex=86400)
+            logger.error(f"Key {self.key_hash[:6]}... JAILED for 24h due to hard quota error.")
+        except Exception as e:
+            logger.error(f"Redis jail error: {e}")
 
 class KeyManager:
     def __init__(self, config: Config, redis_client: redis.Redis):
@@ -265,7 +292,7 @@ class KeyManager:
         return None
 
     def has_any_daily_capacity(self) -> bool:
-        return any(t.has_daily_capacity for t in self.trackers)
+        return any(t.has_daily_capacity and not t.is_jailed() for t in self.trackers)
 
 # --- AI Cleaner ---
 class AICleaner:
@@ -287,35 +314,47 @@ class AICleaner:
         
         while True:
             # 1. Check if we have ANY capacity (Daily) or Gemini
-            # If all OpenRouter keys are daily-exhausted AND no Gemini key, we stop.
             if not self.key_manager.has_any_daily_capacity() and not self.gemini_client:
-                logger.warning("All AI keys exhausted (Daily Limit). Stopping cycle.")
+                logger.warning("All AI keys exhausted (Daily Limit/Jailed). Stopping cycle.")
                 break
 
             conn = self.db.get_connection()
             cursor = conn.cursor(dictionary=True)
             
-            # Fetch small batch
+            # Fetch batch, filtering out very short descriptions
             cursor.execute("""
                 SELECT id, role, company, description, company_profile, link, deadline, tech_park
                 FROM jobs 
                 WHERE is_cleaned = FALSE AND cleaned_data IS NULL 
+                AND LENGTH(description) > 50
                 ORDER BY id DESC 
                 LIMIT 5
             """)
             batch = cursor.fetchall()
             cursor.close()
-            conn.close() # Close immediately to free connection while processing AI
+            conn.close()
 
             if not batch:
                 logger.info("No more uncleaned jobs found.")
                 break
 
             job_map = {str(j['id']): j for j in batch}
-            batch_input = [{"id": j['id'], "text": f"Role: {j['role']}\nCompany: {j['company']}\nDesc: {j['description']}"} for j in batch]
+            # Truncate inputs to 2500 characters
+            batch_input = []
+            for j in batch:
+                desc = (j['description'] or "")[:2500]
+                prof = (j['company_profile'] or "")[:2500]
+                batch_input.append({
+                    "id": j['id'], 
+                    "text": f"Role: {j['role']}\nCompany: {j['company']}\nDesc: {desc}\nCompanyProfile: {prof}"
+                })
+
             prompt = f"""
-            Extract data into JSON. Keys are input IDs. 
-            Value format: {{"job_title", "job_summary", "skills": [], "experience_required", "clean_description", "clean_address", "clean_email"}}
+            Extract job details into JSON. Keys are input IDs. 
+            Value format: {{"job_title", "job_summary", "skills": [], "experience_required", "clean_description", "clean_address", "clean_email", "clean_company_profile"}}
+            Instructions:
+            1. If 'CompanyProfile' input is empty or identical to 'Description', return null or an empty string for 'clean_company_profile'.
+            2. Ensure all other fields are extracted accurately from the text.
             Input: {json.dumps(batch_input)}
             """
 
@@ -330,19 +369,19 @@ class AICleaner:
                 client = self.gemini_client
             
             if not client:
-                # If we are here, it means has_any_daily_capacity() was true (or Gemini exists),
-                # BUT get_best_client() failed. This implies RPM Limit / Cooldown.
                 logger.info("Keys momentarily unavailable (RPM/Cooldown). Sleeping 10s...")
                 time.sleep(10)
                 continue
 
             # 3. Execute
             try:
-                conn = self.db.get_connection() # Reconnect for update
+                conn = self.db.get_connection()
                 response_text = client.generate_cleaned_data(prompt)
                 
-                if "quota" in response_text.lower() or ("limit" in response_text.lower() and "error" in response_text.lower()):
-                    raise RateLimitError("Soft quota limit detected in response body", response=None, body=None)
+                # Check for hard quota errors in response body (some providers return 200 with error JSON)
+                if any(x in response_text.lower() for x in ["credit", "quota", "insufficient", "balance"]):
+                    if tracker: tracker.jail()
+                    raise RateLimitError("Hard quota limit detected in response", response=None, body=None)
 
                 if tracker: tracker.increment_usage()
 
@@ -367,20 +406,16 @@ class AICleaner:
                 conn.commit()
                 logger.info(f"Cleaned batch of {count} jobs.")
                 conn.close()
-                
-                # Small courtesy sleep to not hammer DB/CPU, but very short
                 time.sleep(1)
 
             except RateLimitError as e:
                 if conn: conn.close()
                 logger.warning(f"Rate Limit Hit: {e}")
                 if tracker: tracker.trigger_cooldown()
-                continue # Loop again to try next key immediately
+                continue 
             except Exception as e:
                 if conn: conn.close()
                 logger.error(f"Batch Error: {e}")
-                # If it's not a rate limit, maybe skip this batch or sleep? 
-                # Let's sleep briefly to avoid error loops
                 time.sleep(5)
         
         self.cache_to_redis()
@@ -410,7 +445,6 @@ class AICleaner:
                     "is_cleaned": False
                 })
 
-            # Use self.redis since we have it
             self.redis.set("jobs_data", json.dumps(formatted))
             self.redis.set("last_updated", datetime.now().isoformat())
             logger.info("Redis Cache updated.")
@@ -449,7 +483,8 @@ class JobScraper:
             cursor = conn.cursor()
             q = """INSERT IGNORE INTO jobs 
                    (company, role, deadline, link, tech_park, description, company_profile, email)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"""
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """
             cursor.executemany(q, jobs)
             logger.info(f"Saved {cursor.rowcount} new jobs.")
             conn.close()
@@ -527,8 +562,13 @@ class JobScraper:
             c_html = await self.fetch(session, f"https://infopark.in/companies/profile/{company_id}")
             if c_html:
                 c_soup = BeautifulSoup(c_html, "html.parser")
-                name = c_soup.find("h4").get_text(strip=True) if c_soup.find("h4") else ""
-                profile = f"Company: {name}"
+                # Updated profile search logic
+                prof_div = c_soup.find("div", class_="company-desc") or c_soup.find(id="about-company")
+                if prof_div:
+                    profile = prof_div.get_text(strip=True)
+                else:
+                    name = c_soup.find("h4").get_text(strip=True) if c_soup.find("h4") else ""
+                    profile = f"Company: {name}"
         except: pass
         
         emails = re.findall(r'[\w\.-]+@[\w\.-]+', desc)
@@ -572,19 +612,15 @@ class JobScraper:
         
         # --- Description Strategies ---
         description = "N/A"
-        
-        # Strategy 1: The "Gold Standard" Class
         target_div = soup.select_one(".jd-description-text")
         if target_div:
             description = target_div.get_text(strip=True, separator="\n")
             
-        # Strategy 2: The TinyMCE Container
         if description == "N/A" or len(description) < 50:
             target_div = soup.select_one("div._mce-content-body_silut_1")
             if target_div:
                 description = target_div.get_text(strip=True, separator="\n")
 
-        # Strategy 3: Header Search (Fallback)
         if description == "N/A" or len(description) < 50:
             header = soup.find("h3", string=lambda t: t and "Brief Description" in t)
             if header:
@@ -675,12 +711,8 @@ async def main():
 
     while True:
         try:
-            # 1. Scrape (Always runs)
             await scraper.run_cycle()
-            
-            # 2. Clean (Intelligent: Checks quota first)
             cleaner.process_jobs()
-            
         except Exception as e:
             logger.error(f"Main Loop Error: {e}")
 
