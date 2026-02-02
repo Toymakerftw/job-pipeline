@@ -1,0 +1,27 @@
+{
+  "infopark_list": {
+    "rows": "#job-list tbody tr",
+    "link": "td.btn-sec a",
+    "role": "td:nth-child(3)",
+    "company": "td.date",
+    "deadline": "td.head"
+  },
+  "infopark_detail": {
+    "description": "div.deatil-box",
+    "profile_section": "div.company-desc, #about-company",
+    "profile_name_fallback": "h4"
+  },
+  "technopark_detail": {
+    "description_primary": ".jd-description-text",
+    "description_secondary": "div._mce-content-body_silut_1",
+    "company": "div.w-full a",
+    "email": "a[href^='mailto:']"
+  },
+  "ul_list": {
+    "table": "table.table",
+    "role_link": "td:nth-child(1) a",
+    "company_link": "td:nth-child(2) a",
+    "apply_link": "td:nth-child(3) a",
+    "date_text": "td:nth-child(1)"
+  }
+}

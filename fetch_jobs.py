@@ -59,6 +59,9 @@ class Config:
     # Per-Key Limits (Default: OpenRouter Free Tier)
     OR_KEY_RPM_LIMIT: int = int(os.getenv("OR_KEY_RPM_LIMIT", "20"))
     OR_KEY_DAILY_LIMIT: int = int(os.getenv("OR_KEY_DAILY_LIMIT", "50"))
+    
+    # Config File
+    SELECTOR_CONFIG_PATH: str = "scraping_config.json"
 
 # --- Logging Setup ---
 os.makedirs("logs", exist_ok=True)
@@ -169,29 +172,37 @@ class DBManager:
 
 # --- AI Clients ---
 class LLMProvider:
-    def generate_cleaned_data(self, prompt: str) -> str: raise NotImplementedError
+    def generate_content(self, prompt: str) -> str: raise NotImplementedError
 
 class NativeGeminiClient(LLMProvider):
     def __init__(self, key):
         self.client = genai.Client(api_key=key)
-    def generate_cleaned_data(self, prompt: str) -> str:
-        res = self.client.models.generate_content(
-            model="gemini-2.0-flash", contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json")
-        )
-        return res.text
+    def generate_content(self, prompt: str) -> str:
+        try:
+            res = self.client.models.generate_content(
+                model="gemini-2.0-flash", contents=prompt,
+                config=types.GenerateContentConfig(response_mime_type="application/json")
+            )
+            return res.text
+        except Exception as e:
+            logger.error(f"Gemini Error: {e}")
+            raise
 
 class OpenRouterClient(LLMProvider):
     def __init__(self, key):
         self.client = openai.OpenAI(base_url="https://openrouter.ai/api/v1", api_key=key, max_retries=0)
-    def generate_cleaned_data(self, prompt: str) -> str:
-        res = self.client.chat.completions.create(
-            model="mistralai/mistral-small-3.1-24b-instruct:free",
-            messages=[{"role": "system", "content": "Output valid JSON only."}, 
-                      {"role": "user", "content": prompt}],
-            response_format={"type": "json_object"}
-        )
-        return res.choices[0].message.content
+    def generate_content(self, prompt: str) -> str:
+        try:
+            res = self.client.chat.completions.create(
+                model="mistralai/mistral-small-3.1-24b-instruct:free",
+                messages=[{"role": "system", "content": "Output valid JSON only."}, 
+                          {"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}
+            )
+            return res.choices[0].message.content
+        except Exception as e:
+            logger.error(f"OpenRouter Error: {e}")
+            raise
 
 # --- Key Management ---
 class KeyTracker:
@@ -212,7 +223,7 @@ class KeyTracker:
             return int(val) if val else 0
         except Exception as e:
             logger.error(f"Redis get error: {e}")
-            return 9999 # Fail safe to avoid usage if redis down
+            return 9999 
 
     @property
     def has_daily_capacity(self) -> bool:
@@ -226,44 +237,29 @@ class KeyTracker:
             return False
 
     def is_available(self) -> bool:
-        # Check Jail
-        if self.is_jailed():
-            return False
-
-        # Check Local Cooldown
-        if time.time() < self.cooldown_until:
-            return False
-            
-        # Check Daily Limit
-        if not self.has_daily_capacity:
-            return False
-
-        # Check RPM (Sliding window using Redis Sorted Set)
+        if self.is_jailed(): return False
+        if time.time() < self.cooldown_until: return False
+        if not self.has_daily_capacity: return False
         try:
             now = time.time()
             pipe = self.r.pipeline()
             pipe.zremrangebyscore(self.rpm_key, 0, now - 60)
             pipe.zcard(self.rpm_key)
             results = pipe.execute()
-            
-            if results[1] >= self.config.OR_KEY_RPM_LIMIT:
-                return False
+            if results[1] >= self.config.OR_KEY_RPM_LIMIT: return False
         except Exception as e:
             logger.error(f"Redis RPM check error: {e}")
             return False
-            
         return True
 
     def increment_usage(self):
         now = time.time()
         try:
             pipe = self.r.pipeline()
-            # RPM tracking
             pipe.zadd(self.rpm_key, {str(now): now})
             pipe.expire(self.rpm_key, 120)
-            # Daily usage
             pipe.incr(self.usage_key)
-            pipe.expire(self.usage_key, 86400) # 24h
+            pipe.expire(self.usage_key, 86400) 
             pipe.execute()
         except Exception as e:
             logger.error(f"Redis error incrementing usage: {e}")
@@ -271,14 +267,6 @@ class KeyTracker:
     def trigger_cooldown(self, seconds=60):
         self.cooldown_until = time.time() + seconds
         logger.warning(f"Key {self.key_hash[:6]}... on local cooldown for {seconds}s")
-
-    def jail(self):
-        """Ban key for 24 hours on hard quota errors"""
-        try:
-            self.r.set(self.jail_key, "1", ex=86400)
-            logger.error(f"Key {self.key_hash[:6]}... JAILED for 24h due to hard quota error.")
-        except Exception as e:
-            logger.error(f"Redis jail error: {e}")
 
 class KeyManager:
     def __init__(self, config: Config, redis_client: redis.Redis):
@@ -294,52 +282,117 @@ class KeyManager:
     def has_any_daily_capacity(self) -> bool:
         return any(t.has_daily_capacity and not t.is_jailed() for t in self.trackers)
 
-# --- AI Cleaner ---
+# --- Selectors & Self-Healing ---
+class SelectorManager:
+    def __init__(self, config_path: str):
+        self.config_path = config_path
+        self.selectors = self._load_selectors()
+
+    def _load_selectors(self) -> Dict:
+        if os.path.exists(self.config_path):
+            with open(self.config_path, 'r') as f:
+                return json.load(f)
+        return {}
+
+    def get(self, section: str, key: str, default: str = None) -> str:
+        return self.selectors.get(section, {}).get(key, default)
+
+    def update(self, section: str, key: str, value: str):
+        if section not in self.selectors:
+            self.selectors[section] = {}
+        self.selectors[section][key] = value
+        with open(self.config_path, 'w') as f:
+            json.dump(self.selectors, f, indent=2)
+        logger.info(f"Updated selector [{section}][{key}] -> {value}")
+
+class SelfHealer:
+    def __init__(self, config: Config, key_manager: KeyManager, gemini_client: Optional[NativeGeminiClient], selector_manager: SelectorManager):
+        self.config = config
+        self.key_manager = key_manager
+        self.gemini_client = gemini_client
+        self.selector_manager = selector_manager
+
+    def _get_client(self):
+        tracker = None
+        client = None
+        or_result = self.key_manager.get_best_client()
+        if or_result:
+            tracker, client = or_result
+        elif self.gemini_client:
+            client = self.gemini_client
+        return tracker, client
+
+    def heal_extraction(self, html_snippet: str, section: str, field_key: str, context_desc: str) -> Optional[str]:
+        logger.warning(f"Attempting self-healing for {section}.{field_key} ({context_desc})...")
+        tracker, client = self._get_client()
+        if not client:
+            logger.error("No AI client available for self-healing.")
+            return None
+
+        prompt = f"""
+        I have a snippet of HTML from a {context_desc}. 
+        I need to extract the '{field_key}'. The previous CSS selector failed. 
+        
+        Task:
+        1. Extract the value for '{field_key}' from the HTML.
+        2. Create a NEW, robust CSS selector that would find this element.
+        
+        HTML Snippet:
+        ```html
+        {html_snippet[:4000]}
+        ```
+        
+        Return JSON format: {{"extracted_value": "...", "new_selector": "..."}}
+        """
+
+        try:
+            resp_text = client.generate_content(prompt)
+            if tracker: tracker.increment_usage()
+            
+            data = json.loads(resp_text)
+            val = data.get("extracted_value")
+            new_sel = data.get("new_selector")
+            
+            if val and new_sel:
+                logger.info(f"Self-healing successful! Found: {val}, New Selector: {new_sel}")
+                self.selector_manager.update(section, field_key, new_sel)
+                return val
+        except Exception as e:
+            logger.error(f"Self-healing failed: {e}")
+        return None
+
+# --- AI Cleaner (Processing) ---
 class AICleaner:
-    def __init__(self, config: Config, db: DBManager):
+    def __init__(self, config: Config, db: DBManager, key_manager: KeyManager, gemini_client):
         self.config = config
         self.db = db
-        # Redis connection for KeyManager
-        self.redis = redis.Redis(
-            host=config.REDIS_HOST, 
-            port=config.REDIS_PORT, 
-            password=config.REDIS_PASSWORD, 
-            decode_responses=True
-        )
-        self.key_manager = KeyManager(config, self.redis)
-        self.gemini_client = NativeGeminiClient(config.GEMINI_API_KEY) if config.GEMINI_API_KEY else None
+        self.key_manager = key_manager
+        self.gemini_client = gemini_client
+        self.redis = redis.Redis(host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=True)
 
     def process_jobs(self):
         logger.info("Starting AI Cleaning Cycle...")
         
         while True:
-            # 1. Check if we have ANY capacity (Daily) or Gemini
             if not self.key_manager.has_any_daily_capacity() and not self.gemini_client:
-                logger.warning("All AI keys exhausted (Daily Limit/Jailed). Stopping cycle.")
                 break
 
             conn = self.db.get_connection()
             cursor = conn.cursor(dictionary=True)
-            
-            # Fetch batch, filtering out very short descriptions
             cursor.execute("""
                 SELECT id, role, company, description, company_profile, link, deadline, tech_park
                 FROM jobs 
                 WHERE is_cleaned = FALSE AND cleaned_data IS NULL 
                 AND LENGTH(description) > 50
-                ORDER BY id DESC 
-                LIMIT 5
+                ORDER BY id DESC LIMIT 5
             """)
             batch = cursor.fetchall()
             cursor.close()
             conn.close()
 
-            if not batch:
-                logger.info("No more uncleaned jobs found.")
-                break
+            if not batch: break
 
             job_map = {str(j['id']): j for j in batch}
-            # Truncate inputs to 2500 characters
             batch_input = []
             for j in batch:
                 desc = (j['description'] or "")[:2500]
@@ -352,16 +405,11 @@ class AICleaner:
             prompt = f"""
             Extract job details into JSON. Keys are input IDs. 
             Value format: {{"job_title", "job_summary", "skills": [], "experience_required", "clean_description", "clean_address", "clean_email", "clean_company_profile"}}
-            Instructions:
-            1. If 'CompanyProfile' input is empty or identical to 'Description', return null or an empty string for 'clean_company_profile'.
-            2. Ensure all other fields are extracted accurately from the text.
             Input: {json.dumps(batch_input)}
             """
 
-            # 2. Get Client
             tracker = None
             client = None
-            
             or_result = self.key_manager.get_best_client()
             if or_result:
                 tracker, client = or_result
@@ -369,18 +417,12 @@ class AICleaner:
                 client = self.gemini_client
             
             if not client:
-                logger.info("Keys momentarily unavailable (RPM/Cooldown). Sleeping 10s...")
                 time.sleep(10)
                 continue
 
-            # 3. Execute
             try:
                 conn = self.db.get_connection()
-                response_text = client.generate_cleaned_data(prompt)
-                
-                # Check for hard quota errors in response body (some providers return 200 with error JSON)
-                # Removed aggressive check for keywords like "balance" to avoid false positives (e.g. "work-life balance")
-                
+                response_text = client.generate_content(prompt)
                 if tracker: tracker.increment_usage()
 
                 cleaned_batch = json.loads(response_text)
@@ -406,11 +448,6 @@ class AICleaner:
                 conn.close()
                 time.sleep(1)
 
-            except RateLimitError as e:
-                if conn: conn.close()
-                logger.warning(f"Rate Limit Hit: {e}")
-                if tracker: tracker.trigger_cooldown()
-                continue 
             except Exception as e:
                 if conn: conn.close()
                 logger.error(f"Batch Error: {e}")
@@ -445,15 +482,16 @@ class AICleaner:
 
             self.redis.set("jobs_data", json.dumps(formatted))
             self.redis.set("last_updated", datetime.now().isoformat())
-            logger.info("Redis Cache updated.")
         except Exception as e:
             logger.error(f"Redis update failed: {e}")
 
-# --- Scraping Logic ---
+# --- Scraping Logic with Self-Healing ---
 class JobScraper:
-    def __init__(self, config: Config, db: DBManager):
+    def __init__(self, config: Config, db: DBManager, healer: SelfHealer, selector_manager: SelectorManager):
         self.config = config
         self.db = db
+        self.healer = healer
+        self.selectors = selector_manager
         self.existing_links = db.get_existing_links()
 
     async def run_cycle(self):
@@ -493,7 +531,7 @@ class JobScraper:
         unique = []
         seen = set()
         for job in jobs:
-            signature = f"{job[1]}-{job[0]}".lower() # Role - Company
+            signature = f"{job[1]}-{job[0]}".lower()
             if signature not in seen:
                 seen.add(signature)
                 unique.append(job)
@@ -515,28 +553,50 @@ class JobScraper:
         except Exception as e:
             return None
 
+    def _extract_text(self, element, selector, section, key, html_context):
+        if not selector: return "N/A"
+        found = element.select_one(selector)
+        if found:
+            return found.get_text(strip=True)
+        
+        # Healing Trigger
+        repaired = self.healer.heal_extraction(html_context, section, key, f"{section} job row")
+        return repaired if repaired else "N/A"
+
     async def scrape_infopark(self):
         logger.info("Scraping Infopark...")
         async with aiohttp.ClientSession() as session:
             page = 1
             jobs = []
+            
+            # Load Selectors
+            section = "infopark_list"
+            sel_rows = self.selectors.get(section, "rows")
+            sel_link = self.selectors.get(section, "link")
+            sel_role = self.selectors.get(section, "role")
+            sel_comp = self.selectors.get(section, "company")
+            sel_dead = self.selectors.get(section, "deadline")
+
             while page < 5: 
                 url = f"{self.config.INFOPARK_URL}?page={page}"
                 html = await self.fetch(session, url)
                 if not html: break
                 soup = BeautifulSoup(html, "html.parser")
-                rows = soup.select("#job-list tbody tr")
+                rows = soup.select(sel_rows)
                 if not rows: break
                 
                 tasks = []
                 for row in rows:
-                    link_tag = row.select_one("td.btn-sec a")
+                    link_tag = row.select_one(sel_link)
                     if not link_tag: continue
                     link = link_tag.get("href")
                     if link in self.existing_links: continue
-                    role = row.select_one("td:nth-child(3)").get_text(strip=True) if row.select_one("td:nth-child(3)") else "N/A"
-                    company = row.select_one("td.date").get_text(strip=True) if row.select_one("td.date") else "N/A"
-                    deadline = row.select_one("td.head").get_text(strip=True) if row.select_one("td.head") else "N/A"
+                    
+                    row_html = str(row)
+                    role = self._extract_text(row, sel_role, section, "role", row_html)
+                    company = self._extract_text(row, sel_comp, section, "company", row_html)
+                    deadline = self._extract_text(row, sel_dead, section, "deadline", row_html)
+
                     tasks.append((company, role, deadline, link, "Infopark", self.get_infopark_details(session, link)))
                 
                 for company, role, deadline, link, source, task in tasks:
@@ -551,8 +611,11 @@ class JobScraper:
         html = await self.fetch(session, link)
         if not html: return "", "", ""
         soup = BeautifulSoup(html, "html.parser")
-        desc_div = soup.find("div", class_="deatil-box")
-        desc = desc_div.get_text(strip=True) if desc_div else ""
+        
+        section = "infopark_detail"
+        sel_desc = self.selectors.get(section, "description")
+        
+        desc = self._extract_text(soup, sel_desc, section, "description", str(soup)[:5000])
         
         profile = ""
         try:
@@ -560,13 +623,16 @@ class JobScraper:
             c_html = await self.fetch(session, f"https://infopark.in/companies/profile/{company_id}")
             if c_html:
                 c_soup = BeautifulSoup(c_html, "html.parser")
-                # Updated profile search logic
-                prof_div = c_soup.find("div", class_="company-desc") or c_soup.find(id="about-company")
+                sel_prof = self.selectors.get(section, "profile_section")
+                prof_div = c_soup.select_one(sel_prof)
+                
                 if prof_div:
                     profile = prof_div.get_text(strip=True)
                 else:
-                    name = c_soup.find("h4").get_text(strip=True) if c_soup.find("h4") else ""
-                    profile = f"Company: {name}"
+                    # Try fallback
+                    sel_fallback = self.selectors.get(section, "profile_name_fallback")
+                    name = c_soup.select_one(sel_fallback)
+                    if name: profile = f"Company: {name.get_text(strip=True)}"
         except: pass
         
         emails = re.findall(r'[\w\.-]+@[\w\.-]+', desc)
@@ -608,36 +674,33 @@ class JobScraper:
         if not html: return "", "", ""
         soup = BeautifulSoup(html, "html.parser")
         
-        # --- Description Strategies ---
+        section = "technopark_detail"
+        
         description = "N/A"
-        target_div = soup.select_one(".jd-description-text")
+        sel_prim = self.selectors.get(section, "description_primary")
+        target_div = soup.select_one(sel_prim)
         if target_div:
             description = target_div.get_text(strip=True, separator="\n")
             
         if description == "N/A" or len(description) < 50:
-            target_div = soup.select_one("div._mce-content-body_silut_1")
-            if target_div:
+             sel_sec = self.selectors.get(section, "description_secondary")
+             target_div = soup.select_one(sel_sec)
+             if target_div:
                 description = target_div.get_text(strip=True, separator="\n")
-
-        if description == "N/A" or len(description) < 50:
-            header = soup.find("h3", string=lambda t: t and "Brief Description" in t)
-            if header:
-                parent_wrapper = header.find_parent("div")
-                if parent_wrapper:
-                    description = parent_wrapper.get_text(strip=True, separator="\n")
-                    description = description.replace("Brief Description", "").strip()
 
         if description == "N/A":
              description = ""
 
         # Profile
-        comp_div = soup.find("div", class_="w-full")
-        comp_name = comp_div.find("a").get_text(strip=True) if comp_div and comp_div.find("a") else "N/A"
+        sel_comp = self.selectors.get(section, "company")
+        comp_div = soup.select_one(sel_comp)
+        comp_name = comp_div.get_text(strip=True) if comp_div else "N/A"
         profile = f"Company: {comp_name}"
         
         # Email
         email = ""
-        a_tag = soup.find("a", href=lambda x: x and "mailto:" in x)
+        sel_email = self.selectors.get(section, "email")
+        a_tag = soup.select_one(sel_email)
         if a_tag: email = a_tag.get_text(strip=True).replace("mailto:", "")
         
         return description, profile, email
@@ -650,20 +713,33 @@ class JobScraper:
             html = await self.fetch(session, url)
             if not html: return []
             soup = BeautifulSoup(html, "html.parser")
-            table = soup.find("table", class_="table")
+            
+            section = "ul_list"
+            sel_table = self.selectors.get(section, "table")
+            table = soup.select_one(sel_table)
             if not table: return []
             
-            for row in table.find_all("tr")[1:]: 
+            rows = table.find_all("tr")[1:]
+            sel_link = self.selectors.get(section, "apply_link")
+            sel_role = self.selectors.get(section, "role_link")
+            sel_comp = self.selectors.get(section, "company_link")
+            
+            for row in rows: 
                 tds = row.find_all("td")
                 if len(tds) < 3: continue
-                link = tds[2].find("a").get("href") if tds[2].find("a") else None
+                
+                link_tag = row.select_one(sel_link)
+                link = link_tag.get("href") if link_tag else None
                 if not link: continue
+                
                 if not link.startswith("http"): link = f"{self.config.UL_URL}/{link}"
                 if link in self.existing_links: continue
                 
-                role = tds[0].find("a").get_text(strip=True) if tds[0].find("a") else "N/A"
-                company = tds[1].find("a").get_text(strip=True) if tds[1].find("a") else "N/A"
+                row_html = str(row)
+                role = self._extract_text(row, sel_role, section, "role_link", row_html)
+                company = self._extract_text(row, sel_comp, section, "company_link", row_html)
                 
+                # Date parsing is specific here
                 text = tds[0].get_text(strip=True)
                 match = re.search(r'(\d{2}-\d{2}-\d{4})', text)
                 deadline = match.group(1) if match else "N/A"
@@ -702,8 +778,21 @@ async def main():
     db = DBManager(cfg)
     db.init_db()
     
-    scraper = JobScraper(cfg, db)
-    cleaner = AICleaner(cfg, db)
+    redis_client = redis.Redis(
+        host=cfg.REDIS_HOST, 
+        port=cfg.REDIS_PORT, 
+        password=cfg.REDIS_PASSWORD, 
+        decode_responses=True
+    )
+    
+    key_manager = KeyManager(cfg, redis_client)
+    gemini_client = NativeGeminiClient(cfg.GEMINI_API_KEY) if cfg.GEMINI_API_KEY else None
+    
+    selector_manager = SelectorManager(cfg.SELECTOR_CONFIG_PATH)
+    healer = SelfHealer(cfg, key_manager, gemini_client, selector_manager)
+    
+    scraper = JobScraper(cfg, db, healer, selector_manager)
+    cleaner = AICleaner(cfg, db, key_manager, gemini_client)
 
     logger.info("System Ready.")
 

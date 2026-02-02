@@ -44,6 +44,8 @@ services:
       - PROCESS_INTERVAL=3600
       - OR_KEY_RPM_LIMIT=20
       - OR_KEY_DAILY_LIMIT=50
+    volumes:
+      - ./scraping_config.json:/app/scraping_config.json
 
 volumes:
   db_data:
