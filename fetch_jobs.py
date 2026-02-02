@@ -514,6 +514,7 @@ class JobScraper:
         logger.info("Scrape Cycle Finished.")
 
     def save_jobs(self, jobs: List[Tuple]):
+        batch_size = 50
         try:
             conn = self.db.get_connection()
             cursor = conn.cursor()
@@ -521,11 +522,21 @@ class JobScraper:
                    (company, role, deadline, link, tech_park, description, company_profile, email)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """
-            cursor.executemany(q, jobs)
-            logger.info(f"Saved {cursor.rowcount} new jobs.")
+            
+            total_saved = 0
+            for i in range(0, len(jobs), batch_size):
+                batch = jobs[i:i + batch_size]
+                try:
+                    cursor.executemany(q, batch)
+                    total_saved += cursor.rowcount
+                    conn.commit() # Commit after each batch
+                except Exception as batch_err:
+                    logger.error(f"Error saving batch {i}-{i+batch_size}: {batch_err}")
+
+            logger.info(f"Saved {total_saved} new jobs (in batches).")
             conn.close()
         except Exception as e:
-            logger.error(f"DB Save Error: {e}")
+            logger.error(f"DB Connection/Save Error: {e}")
 
     def remove_similar_jobs(self, jobs):
         unique = []
