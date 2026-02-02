@@ -514,7 +514,7 @@ class JobScraper:
         logger.info("Scrape Cycle Finished.")
 
     def save_jobs(self, jobs: List[Tuple]):
-        batch_size = 50
+        batch_size = 10
         try:
             conn = self.db.get_connection()
             cursor = conn.cursor()
