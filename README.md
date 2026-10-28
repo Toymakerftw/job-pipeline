@@ -1,126 +1,135 @@
 # Techpark Jobs Pipeline 🚀
 
-A robust, asynchronous Python scraper that aggregates job listings from major IT parks in Kerala (Infopark, Technopark, UL Cyberpark, and Cyberpark Kozhikode) into a central MySQL database.
+A serverless job scraper that aggregates job listings from major IT parks in Kerala (Infopark, Technopark, UL Cyberpark, and Cyberpark Kozhikode) into a committed `data/jobs.json` file.
+
+## Architecture (Serverless)
+
+1. **GitHub Actions** runs `scrape.py` every 6 hours (and on `workflow_dispatch`).
+2. The scraper writes/updates `data/jobs.json` in this repo.
+3. Your Vercel front-end loads data from the raw GitHub URL:
+   `https://raw.githubusercontent.com/<owner>/<repo>/<branch>/data/jobs.json`
+
+No always-on server, no MySQL, no Redis.
 
 ## Features
 
-- **Multi-Source Aggregation**: Fetches data from Infopark, Technopark, UL Cyberpark, and Cyberpark RSS feeds.
-- **Asynchronous Scraping**: Built with `aiohttp` and `asyncio` for high-performance data retrieval.
-- **Data Persistence**: Stores job details, company profiles, and contact emails in a MySQL database.
-- **Smart Deduplication**: Uses unique job links and content similarity detection to avoid duplicate entries.
-- **Clean Text**: Improved parsing logic to preserve formatting and readability in job descriptions.
-- **Configurable Sources**: Enable/disable specific job sources via environment variables.
-- **Detailed Statistics**: Tracks and reports scraping statistics including source breakdown and execution time.
-- **Intelligent Data Extraction**: Automatically extracts structured information like experience, skills, and job type from job descriptions.
-- **Robust Error Handling**: Comprehensive error handling and logging with file output.
-- **Dockerized**: Ready for deployment on any server using Docker and Docker Compose.
+- Multi-source aggregation from Infopark, Technopark, UL Cyberpark, and Cyberpark RSS.
+- Asynchronous scraping with `aiohttp` / `asyncio`.
+- Smart deduplication by job link against the committed `data/jobs.json`.
+- Optional AI cleaning via Gemini when `GEMINI_API_KEY` is set.
+- Self-healing CSS selectors for extraction.
+- Commits updated `data/jobs.json` automatically when data changes.
 
-## Prerequisites
+## Secrets (GitHub Actions)
 
-- Python 3.9+ (if running locally)
-- Docker & Docker Compose (Recommended)
+Add these in your repo **Settings → Secrets and variables → Actions**:
 
-## Setup & Usage
+| Secret | Description |
+|--------|-------------|
+| `GEMINI_API_KEY` | Gemini API key for AI cleaning / self-healing (optional) |
 
-### Docker Execution (Recommended)
+The `GITHUB_TOKEN` is provided automatically and used to commit `data/jobs.json`.
 
-This project uses a full stack containerization. `docker-compose` will spin up two containers:
-1. `job-scraper`: The Python script.
-2. `db`: A MySQL 8.0 database.
+## Running Locally
 
-1. **Build the Container**:
-   ```bash
-   docker-compose build
-   ```
+```bash
+# Install deps
+pip install -r requirements.txt
 
-2. **Run the Stack**:
-   ```bash
-   docker-compose up -d
-   ```
-   *Note: This binds port 3306 on your host machine. If you have a local MySQL server running, stop it first to avoid conflicts (`sudo systemctl stop mysql`).*
+# Create .env (optional, for AI cleaning / self-healing)
+cat > .env <<EOF
+GEMINI_API_KEY=your_gemini_key
+EOF
 
-### Local Execution (Manual)
+# Run once
+python scraper_patched.py
+```
 
-If you prefer running the script manually but want to use the Docker database:
+This creates/updates `data/jobs.json` and archives expired jobs to `data/jobs_archive.json`.
 
-1. Start the DB: `docker-compose up -d db`
-2. Install Python deps: `pip install -r requirements.txt`
-3. Run script: `python fetch_jobs.py` (It will connect to `localhost:3306` which is mapped to the container).
+## Data Format
 
-## Connecting Vercel (or External Apps)
+`data/jobs.json` is a JSON array of job objects:
 
-The MySQL database is exposed on **port 3306** of your host machine. To connect your Vercel application:
+```json
+[
+  {
+    "company": "Acme Corp",
+    "role": "Software Engineer",
+    "deadline": "15-12-2026",
+    "link": "https://...",
+    "link_canon": "https://...",
+    "id": "a1b2c3d4e5f6",
+    "tech_park": "Infopark",
+    "description": "...",
+    "company_profile": "...",
+    "email": "hr@acme.com",
+    "posted_date": "2026-10-25",
+    "location": "Kochi",
+    "job_type": "Full-time",
+    "company_logo": "https://.../logo.png",
+    "is_walk_in": false,
+    "is_cleaned": false,
+    "job_active": true,
+    "job_expiry": "2026-12-15",
+    "scraped_at": "2026-10-28T10:03:08Z",
+    "updated_at": "",
+    "job_type": "Full-time",
+    "experience": "2-4 years",
+    "skills": ["Python", "React"],
+    "salary": "₹6-8 LPA",
+    "job_summary": "...",
+    "clean_description": "...",
+    "content_hash": "sha1...",
+    "cleaned_data": { ... }
+  }
+]
 
-1. **Firewall**: Ensure your server allows incoming traffic on port 3306 (e.g., `sudo ufw allow 3306` or update AWS Security Groups).
-2. **Connection Details**:
-   - **Host**: Your Server's Public IP Address
-   - **Port**: `3306`
-   - **User**: `kljobs_user`
-   - **Password**: `PX#lGJi5D68lH@`
-   - **Database**: `kljobs_db`
+| Field | Description |
+|-------|-------------|
+| `id` | Stable frontend key (sha1 of canonical link) |
+| `link_canon` | Canonicalized URL used for dedup |
+| `posted_date` | Date the job was posted (ISO) |
+| `company_logo` | Company logo URL |
+| `is_walk_in` | Whether it's a walk-in interview |
+| `is_cleaned` | Whether AI cleaning was applied |
+| `job_active` | Whether the deadline hasn't passed yet |
+| `job_expiry` | Parsed expiry date (ISO) or `null` |
+| `scraped_at` | UTC timestamp when the job was first scraped |
+| `updated_at` | Last content-refresh timestamp |
+| `job_type` | Full-time / Part-time / Contract (AI-extracted) |
+| `experience` | Years of experience required (AI-extracted) |
+| `skills` | List of required skills (AI-extracted) |
+| `salary` | Salary range (AI-extracted) |
+| `location` | Job location (AI-extracted) |
+| `job_summary` | AI summary (AI-extracted) |
+| `clean_description` | AI-cleaned description (AI-extracted) |
+| `content_hash` | sha1 of key fields; changed records are re-cleaned |
+| `cleaned_data` | Full AI-cleaned object (when `is_cleaned` is true) |
 
-*Security Note: For production, restrict firewall access to specific IPs if possible.*
+Expired jobs (> `ARCHIVE_AFTER_DAYS`, default 30) are moved to `data/jobs_archive.json`.
 
-## Database Schema
+## Loading in Vercel
 
-The `jobs` table in the MySQL database has the following structure:
+Fetch the raw file client-side (or at build time with ISR):
 
-| Column | Type | Description |
-| :--- | :--- | :--- |
-| `id` | INT | Primary key, Auto Increment |
-| `company` | TEXT | Name of the hiring company |
-| `role` | TEXT | Job title / Role |
-| `deadline` | TEXT | Application deadline |
-| `link` | VARCHAR(255) | UNIQUE URL to the job posting |
-| `tech_park` | TEXT | Source (e.g., Infopark, Technopark) |
-| `description`| MEDIUMTEXT | Full job description |
-| `company_profile` | TEXT | Address and contact details |
-| `email` | TEXT | Extracted contact email |
+```js
+const res = await fetch(
+  "https://raw.githubusercontent.com/<owner>/<repo>/<branch>/data/jobs.json"
+);
+const jobs = await res.json();
+```
+
+> Note: GitHub raw URLs are CDN-cached. Add a cache-busting query param or use short revalidation if you need near-real-time freshness.
 
 ## Configuration
 
-You can configure the scraper via environment variables in a `.env` file or pass them directly:
+Edit `scraping_config.json` for CSS selectors per source. Environment variables:
 
-```env
-# Database Configuration
-DB_HOST=localhost
-DB_USER=kljobs_user
-DB_PASSWORD=PX#lGJi5D68lH@
-DB_NAME=kljobs_db
-
-# Gemini API Configuration (For Data Cleaning)
-GEMINI_API_KEY=your_gemini_api_key_here
-
-# OpenRouter Configuration (Optional, for load balancing)
-# Provide comma-separated keys. The system rotates between Gemini and these keys.
-OPENROUTER_API_KEYS=key1,key2,key3
-
-# Target URLs (Optional)
-INFOPARK_URL=https://infopark.in/companies/job-search
-TECHNOPARK_URL=https://technopark.org/api/paginated-jobs
-UL_URL=https://www.ulcyberpark.com/jobs/index
-CYBERPARK_RSS_URL=https://www.cyberparkkerala.org/?feed=job_feed
-
-# Scraper Configuration - Enable/disable specific sources
-ENABLE_INFOPARK=true
-ENABLE_TECHNOPARK=true
-ENABLE_UL=true
-ENABLE_CYBERPARK_RSS=true
-
-# Scraping Configuration
-MAX_CONCURRENT_REQUESTS=10
-REQUEST_TIMEOUT=30
-SCRAPE_DELAY=0.5
-
-# Job Filtering Configuration
-FILTER_EXPIRED_JOBS=true
-MAX_DAYS_TO_DEADLINE=0  # 0 means no limit, positive number sets max days from now
-```
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GEMINI_API_KEY` | — | Gemini key for cleaning/self-healing |
 
 ## Scheduling
 
-To run this as a daily cron job on a Linux server:
-
-```bash
-0 0 * * * cd /path/to/project && /usr/local/bin/docker-compose up > /dev/null 2>&1
-```
+Defined in `.github/workflows/scrape.yml` — runs every 6 hours via `cron: '0 */6 * * *'`.

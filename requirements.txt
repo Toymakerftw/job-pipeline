@@ -1,9 +1,6 @@
-aiohttp
-beautifulsoup4
-python-dotenv
-feedparser
-mysql-connector-python
-python-dateutil
-google-genai
-openai
-redis
+aiohttp>=3.9
+feedparser>=6.0
+beautifulsoup4>=4.12
+soupsieve>=2.5
+python-dotenv>=1.0
+google-genai>=1.0

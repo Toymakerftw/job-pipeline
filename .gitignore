@@ -27,6 +27,12 @@ share/python-wheels/
 *.whl
 *.egg
 
+# Database / runtime artifacts (not committed)
+jobs.db
+*.db
+logs/
+.env
+
 # Virtual environment
 .venv/
 venv/
