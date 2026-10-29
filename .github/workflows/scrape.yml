@@ -26,16 +26,19 @@ jobs:
       - name: Run scraper
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # [P0-8] Healed selectors are downloaded from this raw URL at the start of
+          # every run, then merged back below so self-healing survives across CI runs.
+          SELECTOR_REGISTRY_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/scraping_config.json
         run: python scraper_patched.py
 
-      - name: Commit data if changed
+      - name: Commit data and healed selectors if changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if [ -z "$(git status --porcelain data/)" ]; then
-            echo "No changes to jobs data"
+          if [ -z "$(git status --porcelain data/ scraping_config.json)" ]; then
+            echo "No changes to jobs data or selectors"
           else
-            git add data/
-            git commit -m "chore: update jobs data [skip ci]"
+            git add data/ scraping_config.json
+            git commit -m "chore: update jobs data and healed selectors [skip ci]"
             git push
           fi

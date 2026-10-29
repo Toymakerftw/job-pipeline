@@ -27,6 +27,7 @@ Add these in your repo **Settings → Secrets and variables → Actions**:
 | Secret | Description |
 |--------|-------------|
 | `GEMINI_API_KEY` | Gemini API key for AI cleaning / self-healing (optional) |
+| `SELECTOR_REGISTRY_URL` | Raw URL to a hosted `scraping_config.json` whose healed selectors are downloaded at the start of every run (optional; defaults to this repo's own `scraping_config.json`) |
 
 The `GITHUB_TOKEN` is provided automatically and used to commit `data/jobs.json`.
 
@@ -129,6 +130,11 @@ Edit `scraping_config.json` for CSS selectors per source. Environment variables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GEMINI_API_KEY` | — | Gemini key for cleaning/self-healing |
+| `SELECTOR_REGISTRY_URL` | this repo's raw `scraping_config.json` | URL to download healed selectors from at the start of every run |
+
+### Self-healing selectors
+
+When a CSS selector stops matching a page, the scraper asks Gemini for a replacement, validates it against the page HTML, and persists it to `scraping_config.json`. The workflow commits that file back to the repo, and every subsequent run downloads the latest healed selectors via `SELECTOR_REGISTRY_URL` before scraping — so a fix made once survives across CI runs instead of being re-healed (and re-charged) every 6 hours. Healing degrades gracefully without `GEMINI_API_KEY` or network access.
 
 ## Scheduling
 

@@ -355,6 +355,9 @@ class Config:
     GEMINI_MODEL: str = "gemini-2.0-flash"
     GEMINI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY")
     SELECTOR_CONFIG_PATH: str = SELECTOR_CONFIG_PATH
+    # [P0-8] Remote selector registry: healed selectors are published here and
+    # downloaded at the start of every run so self-healing survives across CI runs.
+    SELECTOR_REGISTRY_URL: str = os.getenv("SELECTOR_REGISTRY_URL", "")
     USER_AGENT: str = "Mozilla/5.0 (compatible; KeralaParkJobScraper/2.0)"
     INSECURE_SSL: bool = True   # parks serve flaky certs; set False with a CA bundle if you can
 
@@ -403,8 +406,9 @@ class SelectorManager:
     breaking the scraper. A current-version file overrides defaults (preserves
     user tweaks and healed selectors)."""
 
-    def __init__(self, config_path: str):
-        self.config_path = config_path
+    def __init__(self, config: Any):
+        self.config_path = config.SELECTOR_CONFIG_PATH
+        self.config = config
         self.selectors: Dict[str, Any] = copy.deepcopy(DEFAULT_SELECTORS)
         self.dirty = False
         if os.path.exists(config_path):
@@ -457,6 +461,32 @@ class SelectorManager:
         _atomic_write_json(self.config_path, self.selectors)
         self.dirty = False
         logger.info(f"Selector config persisted -> {self.config_path}")
+
+    async def merge_remote(self, session: aiohttp.ClientSession) -> None:
+        """[P0-8] Download the latest healed selector registry and merge it over
+        the local config so self-healed selectors survive across CI runs. Network
+        failures degrade gracefully — the scrape continues with local selectors."""
+        url = self.config.SELECTOR_REGISTRY_URL
+        if not url:
+            return
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    logger.warning(
+                        f"selector registry download failed: HTTP {resp.status}; using local config")
+                    return
+                remote = await resp.json(content_type=None)
+        except Exception as e:
+            logger.warning(f"selector registry download unavailable ({e!r}); using local config")
+            return
+        if not isinstance(remote, dict):
+            logger.warning("selector registry payload is not a JSON object; ignoring")
+            return
+        before = copy.deepcopy(self.selectors)
+        self._deep_merge(self.selectors, remote)
+        if self.selectors != before:
+            self.dirty = True
+            logger.info("selector registry merged: healed selectors applied from remote")
 
     def validate(self) -> None:
         """[P3-21] Fail fast if any required selector is missing/empty."""
@@ -1251,7 +1281,7 @@ def merge_jobs(existing: List[dict], new_jobs: List[dict]) -> Tuple[List[dict], 
 
 async def main():
     cfg = Config()
-    selector_manager = SelectorManager(cfg.SELECTOR_CONFIG_PATH)
+    selector_manager = SelectorManager(cfg)
     selector_manager.validate()                      # [P3-21] fail fast
     healer = SelfHealer(cfg, selector_manager)
     cleaner = AICleaner(cfg)
@@ -1276,6 +1306,7 @@ async def main():
             connector=connector, timeout=timeout,
             headers={"User-Agent": cfg.USER_AGENT,
                      "Accept": "text/html,application/json,application/rss+xml;q=0.9,*/*;q=0.8"}) as session:
+        await selector_manager.merge_remote(session)    # [P0-8] pull healed selectors each run
         scraper = JobScraper(cfg, healer, selector_manager, session)
         logger.info("Starting scrape cycle...")
         new_jobs, stats = await scraper.run_cycle()
