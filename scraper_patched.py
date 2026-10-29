@@ -411,10 +411,10 @@ class SelectorManager:
         self.config = config
         self.selectors: Dict[str, Any] = copy.deepcopy(DEFAULT_SELECTORS)
         self.dirty = False
-        if os.path.exists(config_path):
+        if os.path.exists(self.config_path):
             raw: Dict[str, Any] = {}
             try:
-                with open(config_path, "r", encoding="utf-8") as f:
+                with open(self.config_path, "r", encoding="utf-8") as f:
                     raw = json.load(f) or {}
             except Exception as e:
                 logger.warning(f"Selector config unreadable ({e}); using built-in defaults")
@@ -427,9 +427,9 @@ class SelectorManager:
                 self._deep_merge(self.selectors, raw)
                 self.dirty = False
             elif raw:
-                bak = f"{config_path}.v{file_ver}.bak"
+                bak = f"{self.config_path}.v{file_ver}.bak"
                 try:
-                    os.replace(config_path, bak)
+                    os.replace(self.config_path, bak)
                     logger.warning(
                         f"Stale selector config (v{file_ver}, pre-redesign) backed up to {bak}; "
                         f"upgrading to v{CURRENT_CONFIG_VERSION} defaults")
